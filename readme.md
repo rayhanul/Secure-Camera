@@ -223,9 +223,20 @@ sudo tc qdisc add dev enp1so parent root handle 6666 mqprio \
 
 ```
 
+Running the sender: 
 
+```
+python main.py
+```
 
-database : received_images.db 
+This command will turn on camera and start capturing the frame. In addition, it sends frame to receiver over the vlan and ip: 192.168.10.2 
+
+At the receiver, run command: 
+
+``` python receiver-db.py
+```
+
+This will captures frames and saves into sqllite databse: received_images.db 
 
 
 

@@ -249,12 +249,28 @@ This will captures frames and saves into sqllite databse: received_images.db
 
 ### Database Configuration 
 
+open a database:  
+
+```sqlite3 received_images.db
+```
+
+view all records: 
 ```
 SELECT * FROM received_images;
 ```
 
 
 
+get the latest image: 
+
+```SELECT * FROM received_images
+ORDER BY id DESC
+LIMIT 1;```
+
+exit from db: 
+```
+.exit
+```
 
 
 ## Challenges 

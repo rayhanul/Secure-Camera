@@ -267,23 +267,3 @@ Because running this command:  ```tc -p -s -d qdisc show dev sw0ep``` shows only
 
 <img src="./images/tsn-switch-queue-assignment.png" width="400">
 
-```
-root@de-eval-board:/# tc -p -s -d qdisc show dev sw0ep
-
-qdisc mqprio 8001: root tc 3 map 0 0 0 0 1 1 2 2 2 2 2 2 2 2 2 2 
-             queues:(2:2) (1:1) (0:0) 
-             mode:channel
-             shaper:dcb
-
- Sent 12531004 bytes 62647 pkt (dropped 0, overlimits 0 requeues 0) 
- backlog 0b 0p requeues 0
-qdisc pfifo 8003: parent 8001:2 limit 1000p
- Sent 0 bytes 0 pkt (dropped 0, overlimits 0 requeues 0) 
- backlog 0b 0p requeues 0
-qdisc pfifo 8002: parent 8001:1 limit 1000p
- Sent 270 bytes 3 pkt (dropped 0, overlimits 0 requeues 0) 
- backlog 0b 0p requeues 0
-qdisc pfifo 8004: parent 8001:3 limit 1000p
- Sent 12530734 bytes 62644 pkt (dropped 0, overlimits 0 requeues 0) 
- backlog 0b 0p requeues 0
-```

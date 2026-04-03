@@ -59,6 +59,11 @@ sudo ip addr add 192.168.10.2/24 dev enp1s0.10 # receiver
 sudo ip link set dev enp1s0.10 up
 ```
 
+```sudo ip link set enp1s0.10 type vlan egress-qos-map \
+0:0 1:1 2:2 3:3 4:4 5:5 6:6 7:7
+```
+
+
 We will use this VLAN ID and IP address along with interface enp1s0.10 in all future communication 
 
 In addition, we must make sure that the created VLAN is tagged because in untagged vlan pcp does not work and we may not able to see 802.1Q frame description 

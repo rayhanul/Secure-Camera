@@ -1,0 +1,20 @@
+up:
+    docker compose up --build -d
+
+down:
+    docker compose down
+
+restart:
+    docker compose down && docker compose up --build -d
+
+c1:
+    docker exec -it c1_processor bash
+
+ps:
+    docker ps -a
+
+redis:
+	docker exec -it redis_server bash
+
+c2:
+	docker exec -it c2_reid_processor bash

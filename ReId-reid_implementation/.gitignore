@@ -1,0 +1,8 @@
+./C1/venv
+./C1/processed_objects/
+./14086064_3840_2160_25fps.mp4
+models/
+14086064_3840_2160_25fps.mp4
+C1/.env
+.env
+./C2/Pose2ID/

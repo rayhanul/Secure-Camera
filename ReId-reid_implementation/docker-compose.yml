@@ -1,0 +1,174 @@
+version: "3.8"
+
+services:
+    redis:
+        image: redis:7-alpine
+        container_name: redis_server
+        ports:
+            - "6379:6379"
+        volumes:
+            - redis_data:/data
+        command: redis-server --appendonly yes
+        restart: unless-stopped
+        networks:
+            - reid_network
+
+    camera1:
+        build:
+            context: ./C1
+            dockerfile: Dockerfile
+        container_name: c1_processor
+        depends_on:
+            - redis
+        volumes:
+            - ../Pose2ID:/Pose2ID
+            # Model weights
+            - ./models:/models
+            - ./logs:/app/logs
+        environment:
+            - REDIS_HOST=redis
+            - REDIS_PORT=6379
+            - LOG_LEVEL=INFO
+            - MODEL_PATH=/models/yolov8n.pt
+        command: tail -f /dev/null
+        stdin_open: true
+        tty: true
+        networks:
+            - reid_network
+        # command: python main.py --use_camera --camera_id=0 --redis_host redis
+        # command: python main.py
+        # restart: unless-stopped
+
+    # lol, I need to give a proper name for this. `Secure_processor` ?
+    reid_processor:
+        container_name: c2_reid_processor
+        build:
+            context: ./C2
+            dockerfile: Dockerfile
+        depends_on:
+            - redis
+            - weaviate_db
+        environment:
+            - REDIS_HOST=redis
+            - REDIS_PORT=6379
+            - LOG_LEVEL=INFO
+            - MODEL_PATH=/models/yolov8n.pt
+            - WEAVIATE_HOST=weaviate_db
+            - WEAVIATE_PORT=8080
+            - WEAVIATE_SCHEME=http
+            - CUDA_VISIBLE_DEVICES=0
+            - PYTHONPATH=/app/Pose2ID:/app/Pose2ID/IPG/reidmodel
+            - WEAVIATE_API_KEY=${WEAVIATE_API_KEY}
+            - WEAVIATE_URL=${WEAVIATE_URL}
+            - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}
+            - MONGO_ROOT_USERNAME=${MONGO_ROOT_USERNAME}
+            - MONGO_ROOT_PASSWORD=${MONGO_ROOT_PASSWORD}
+            - MONGO_DB_NAME=${MONGO_DB_NAME}
+            - MONGO_COLLECTION_NAME=${MONGO_COLLECTION_NAME}
+            - MONGO_HOST_URL=${MONGO_HOST_URL}
+            - ENC_KEY_BASE64=${ENC_KEY_BASE64}
+        volumes:
+            - ./C2:/app
+            - ./models:/app/models
+            - ./logs:/app/logs
+            - ./data:/app/data
+            # Mount TransReID from the C2 directory
+            - ./C2/TransReID:/app/TransReID
+        networks:
+            - reid_network
+        deploy:
+            resources:
+                reservations:
+                    devices:
+                        - driver: nvidia
+                          count: 1
+                          capabilities: [gpu]
+        # Different run modes - choose one:
+
+        # Mode 1: Interactive mode for testing
+        command: tail -f /dev/null
+        stdin_open: true
+        tty: true
+
+        # Mode 2: Auto-start ReID processing (uncomment to use)
+        # command: python enhanced_c2_weaviate.py --redis_host redis --weaviate_url http://weaviate_db:8080 --use_nfc --save_results
+
+        # Mode 3: Wait for services then start (uncomment to use)
+        # command: >
+        #   sh -c "
+        #     echo 'Waiting for services...' &&
+        #     sleep 30 &&
+        #     python enhanced_c2_weaviate.py --redis_host redis --weaviate_url http://weaviate_db:8080 --use_nfc --save_results
+        #   "
+
+    weaviate_db:
+        command:
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8080"
+            - --scheme
+            - http
+        image: cr.weaviate.io/semitechnologies/weaviate:1.32.2
+        container_name: weaviate_server
+        ports:
+            - 8080:8080
+            - 50051:50051
+        restart: on-failure:0
+        environment:
+            QUERY_DEFAULTS_LIMIT: 25
+            AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
+            DEFAULT_VECTORIZER_MODULE: "none" # We provide our own vectors
+            PERSISTENCE_DATA_PATH: "/var/lib/weaviate"
+            ENABLE_API_BASED_MODULES: "true"
+            BACKUP_FILESYSTEM_PATH: "/var/lib/weaviate/backups"
+            CLUSTER_HOSTNAME: "node1"
+        volumes:
+            - weaviate_data:/var/lib/weaviate
+        networks:
+            - reid_network
+
+    # Mongo DB
+    mongo:
+        image: mongo:latest
+        ports:
+            - "27017:27017"
+        environment:
+            MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME}
+            MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD}
+        volumes:
+            - mongo_data:/data/db
+        networks:
+            - reid_network
+
+    # Optional: Weaviate web interface
+    # weaviate_console:
+    #     image: semitechnologies/weaviate-console:latest
+    #     container_name: weaviate_console
+    #     ports:
+    #         - "3000:3000"
+    #     environment:
+    #         - WEAVIATE_URL=http://weaviate_db:8080
+    #     depends_on:
+    #         - weaviate_db
+    #     networks:
+    #         - reid_network
+
+volumes:
+    redis_data:
+        driver: local
+
+    postgres_data:
+        driver: local
+
+    weaviate_data:
+        driver: local
+
+    mongo_data:
+        driver: local
+
+networks:
+    reid_network:
+        driver: bridge
+        # default:
+        #     name: transreid_network

@@ -23,74 +23,40 @@ HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 class NetworkManager:
     def __init__(
         self,
-        dest_ip=DEST_IP,
-        dest_port=DEST_PORT,
-        priority=VLAN_PRIORITY,
-        interval=INTERVAL,
+        dest_ip="192.168.10.11",
+        dest_port=12345,
+        priority=7,
+        interface_name=None,
     ):
         self.dest_ip = dest_ip
         self.dest_port = dest_port
         self.priority = priority
-        self.interval = interval
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+        if interface_name:
+            self.sock.setsockopt(
+                socket.SOL_SOCKET,
+                socket.SO_BINDTODEVICE,
+                interface_name.encode(),
+            )
+
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_PRIORITY, self.priority)
 
     def send_data(self, data: bytes):
         self.sock.sendto(data, (self.dest_ip, self.dest_port))
 
-    # def send_frame(self, frame_bytes: bytes, frame_id: int):
-    #     max_payload = MAX_DGRAM - HEADER_SIZE
-    #     total_chunks = (len(frame_bytes) + max_payload - 1) // max_payload
+    def send_json(self, payload: dict):
+        raw = json.dumps(payload).encode("utf-8")
+        compressed = zlib.compress(raw)
 
-    #     for chunk_index in range(total_chunks):
-    #         start = chunk_index * max_payload
-    #         end = start + max_payload
-    #         chunk = frame_bytes[start:end]
+        # helpful for debugging payload size
+        print(f"[DEBUG] raw={len(raw)} bytes, compressed={len(compressed)} bytes")
 
-    #         header = struct.pack(
-    #             HEADER_FORMAT,
-    #             frame_id,
-    #             total_chunks,
-    #             chunk_index,
-    #         )
-
-    #         packet = header + chunk
-    #         self.send_data(packet)
-
-
-    def send_frame(self, frame_bytes: bytes, frame_id: int, filename: str):
-        filename_bytes = filename.encode()
-        filename_len = len(filename_bytes)
-
-        max_payload = MAX_DGRAM - HEADER_SIZE
-        total_chunks = (len(frame_bytes) + max_payload - 1) // max_payload
-
-        for chunk_index in range(total_chunks):
-            start = chunk_index * max_payload
-            end = start + max_payload
-            chunk = frame_bytes[start:end]
-
-            if chunk_index == 0:
-                # First packet carries filename
-                payload = filename_bytes + chunk
-            else:
-                payload = chunk
-
-            header = struct.pack(
-                HEADER_FORMAT,
-                frame_id,
-                total_chunks,
-                chunk_index,
-                filename_len if chunk_index == 0 else 0,
-            )
-
-            packet = header + payload
-            self.send_data(packet)
+        self.send_data(compressed)
 
     def close(self):
         self.sock.close()
-
 
 
 

@@ -1,12 +1,21 @@
 import socket
-import time
 import struct
 
 
-DEST_IP = "192.168.10.2"
-DEST_PORT = 12345
-VLAN_PRIORITY = 6
-INTERVAL = 0.1
+import os
+import cv2
+import time
+import json
+import zlib
+import socket
+import base64
+import argparse
+from datetime import datetime
+
+# DEST_IP = "192.168.10.2"
+# DEST_PORT = 12345
+# VLAN_PRIORITY = 6
+# INTERVAL = 0.1
 
 # Keep payload small enough for UDP
 MAX_DGRAM = 60000

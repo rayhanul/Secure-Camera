@@ -152,36 +152,129 @@ class ReIDVectorStore:
             print(f"❌ Error creating collection: {e}")
             raise
 
+    # def store_embeddings(self, objects_data: Dict, embeddings: torch.Tensor):
+    #     """
+    #     Store ReID embeddings with metadata in weaviate
+    #     Arguments:
+    #         objects_data (Dict): Dictionary from C1 containing object metadata
+    #         embeddings (torch.Tensor): Tensor of shape [N, embedding_dim] from C2 ReID Model
+    #     """
+
+    #     if len(objects_data["objects"]) != embeddings.shape[0]:
+    #         raise ValueError("Number of objects must match number of embeddings")
+
+    #     if isinstance(embeddings, torch.Tensor):
+    #         embeddings = embeddings.detach().cpu().numpy()
+
+    #     try:
+    #         # collection = self.client.collections.get(self.collection_name)
+    #         collection = self.client.collections.use(self.collection_name)
+    #         results = []
+
+    #         for i, obj in enumerate(objects_data["objects"]):
+    #             # embedding_vector = embeddings[i].tolist()
+    #             embedding_vector = embeddings[i].astype(np.float32).flatten().tolist()
+    #             # Debug timestamp haI'll send a teams indling
+    #             timestamp_raw = objects_data["metadata"].get(
+    #                 "timestamp", datetime.now().timestamp()
+    #             )
+
+    #             # Handle timestamp conversion more safely
+    #             if isinstance(timestamp_raw, str):
+    #                 # If it's already a string, try to parse it
+    #                 try:
+    #                     from datetime import datetime as dt
+
+    #                     if timestamp_raw.endswith("Z"):
+    #                         timestamp_obj = dt.fromisoformat(timestamp_raw[:-1])
+    #                     else:
+    #                         timestamp_obj = dt.fromisoformat(timestamp_raw)
+    #                     timestamp_iso = timestamp_obj.isoformat() + "Z"
+    #                 except (ValueError, TypeError):
+    #                     timestamp_iso = datetime.now().isoformat() + "Z"
+    #             else:
+    #                 # Convert numeric timestamp to ISO format
+    #                 timestamp_iso = (
+    #                     datetime.fromtimestamp(float(timestamp_raw)).isoformat() + "Z"
+    #                 )
+
+    #             # data_object = {
+    #             #     "object_id": int(obj.get("object_id", f"obj_{i}")),
+    #             #     "class_name": obj.get("class_name", "unknown"),
+    #             #     "confidence": float(obj.get("confidence", 0.0)),  # Ensure float
+    #             #     "bbox": obj.get("bbox", [0, 0, 0, 0]),
+    #             #     "camera_id": str(
+    #             #         objects_data["metadata"].get("camera_id", "unknown")
+    #             #     ),  # Ensure string
+    #             #     "frame_id": int(
+    #             #         objects_data["metadata"].get("frame_id", 0)
+    #             #     ),  # Ensure int
+    #             #     "timestamp": timestamp_iso,
+    #             #     "embedding_method": "Pose2ID_TransReID",
+    #             #     "person_id": str(obj.get("person_id", "unknown")),
+    #             #     "reid_confidence": float(obj.get("reid_confidence", 0.0)),
+    #             #     "is_new_person": bool(obj.get("is_new_person", True)),
+    #             #     "image_crop_base64": obj.get("image_crop_base64", ""),
+    #             # }
+    #             #
+
+    #             data_object = {
+    #                 "class_name": obj.get("class_name", "unknown"),
+    #                 "timestamp": timestamp_iso,
+    #                 "reid_confidence": float(obj.get("reid_confidence", 0.0)),
+    #                 "is_new_person": bool(obj.get("is_new_person", True)),
+    #             }
+
+    #             # Insert single object with vector
+    #             result = collection.data.insert(
+    #                 properties=data_object, vector=embedding_vector
+    #             )
+    #             results.append(result)
+
+    #         print(f"📊 Stored {len(results)} embeddings in Weaviate")
+    #         return results
+
+    #     except Exception as e:
+    #         print(f"❌ Error storing embeddings: {e}")
+    #         return None
+
     def store_embeddings(self, objects_data: Dict, embeddings: torch.Tensor):
         """
-        Store ReID embeddings with metadata in weaviate
+        Store ReID embeddings with metadata in Weaviate
         Arguments:
-            objects_data (Dict): Dictionary from C1 containing object metadata
-            embeddings (torch.Tensor): Tensor of shape [N, embedding_dim] from C2 ReID Model
+            objects_data (Dict): Dictionary from C1/C2 containing object metadata
+            embeddings (torch.Tensor or np.ndarray): shape [N, D] or [D]
         """
 
-        if len(objects_data["objects"]) != embeddings.shape[0]:
-            raise ValueError("Number of objects must match number of embeddings")
-
+        # Convert embeddings safely
         if isinstance(embeddings, torch.Tensor):
             embeddings = embeddings.detach().cpu().numpy()
+        elif isinstance(embeddings, list):
+            embeddings = np.array(embeddings, dtype=np.float32)
+
+        # Make sure embeddings is always 2D: [N, D]
+        if embeddings.ndim == 1:
+            embeddings = embeddings.reshape(1, -1)
+
+        if len(objects_data["objects"]) != embeddings.shape[0]:
+            raise ValueError(
+                f"Number of objects ({len(objects_data['objects'])}) must match "
+                f"number of embeddings ({embeddings.shape[0]})"
+            )
 
         try:
-            # collection = self.client.collections.get(self.collection_name)
             collection = self.client.collections.use(self.collection_name)
             results = []
 
             for i, obj in enumerate(objects_data["objects"]):
-                embedding_vector = embeddings[i].tolist()
+                # ✅ critical fix: flatten to 1D float list
+                embedding_vector = embeddings[i].astype(np.float32).flatten().tolist()
 
-                # Debug timestamp haI'll send a teams indling
                 timestamp_raw = objects_data["metadata"].get(
                     "timestamp", datetime.now().timestamp()
                 )
 
-                # Handle timestamp conversion more safely
                 if isinstance(timestamp_raw, str):
-                    # If it's already a string, try to parse it
                     try:
                         from datetime import datetime as dt
 
@@ -193,30 +286,9 @@ class ReIDVectorStore:
                     except (ValueError, TypeError):
                         timestamp_iso = datetime.now().isoformat() + "Z"
                 else:
-                    # Convert numeric timestamp to ISO format
                     timestamp_iso = (
                         datetime.fromtimestamp(float(timestamp_raw)).isoformat() + "Z"
                     )
-
-                # data_object = {
-                #     "object_id": int(obj.get("object_id", f"obj_{i}")),
-                #     "class_name": obj.get("class_name", "unknown"),
-                #     "confidence": float(obj.get("confidence", 0.0)),  # Ensure float
-                #     "bbox": obj.get("bbox", [0, 0, 0, 0]),
-                #     "camera_id": str(
-                #         objects_data["metadata"].get("camera_id", "unknown")
-                #     ),  # Ensure string
-                #     "frame_id": int(
-                #         objects_data["metadata"].get("frame_id", 0)
-                #     ),  # Ensure int
-                #     "timestamp": timestamp_iso,
-                #     "embedding_method": "Pose2ID_TransReID",
-                #     "person_id": str(obj.get("person_id", "unknown")),
-                #     "reid_confidence": float(obj.get("reid_confidence", 0.0)),
-                #     "is_new_person": bool(obj.get("is_new_person", True)),
-                #     "image_crop_base64": obj.get("image_crop_base64", ""),
-                # }
-                #
 
                 data_object = {
                     "class_name": obj.get("class_name", "unknown"),
@@ -225,9 +297,15 @@ class ReIDVectorStore:
                     "is_new_person": bool(obj.get("is_new_person", True)),
                 }
 
-                # Insert single object with vector
+                print(
+                    f"DEBUG vector type={type(embedding_vector)}, "
+                    f"len={len(embedding_vector)}, "
+                    f"first_type={type(embedding_vector[0]) if embedding_vector else None}"
+                )
+
                 result = collection.data.insert(
-                    properties=data_object, vector=embedding_vector
+                    properties=data_object,
+                    vector=embedding_vector,
                 )
                 results.append(result)
 
@@ -237,6 +315,7 @@ class ReIDVectorStore:
         except Exception as e:
             print(f"❌ Error storing embeddings: {e}")
             return None
+
 
     def search_similar(
         self,
@@ -257,10 +336,15 @@ class ReIDVectorStore:
             distance_threshold (float): Maximum Euclidean distance threshold
         """
 
+        # if isinstance(query_embedding, torch.Tensor):
+        #     query_vector = query_embedding.detach().cpu().numpy().flatten().tolist()
+        # else:
+        #     query_vector = query_embedding.flatten().tolist()
+
         if isinstance(query_embedding, torch.Tensor):
-            query_vector = query_embedding.detach().cpu().numpy().flatten().tolist()
+            query_vector = query_embedding.detach().cpu().numpy().flatten().astype(np.float32).tolist()
         else:
-            query_vector = query_embedding.flatten().tolist()
+            query_vector = np.array(query_embedding, dtype=np.float32).flatten().tolist()
 
         try:
             # Use v4 API syntax

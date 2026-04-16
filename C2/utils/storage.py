@@ -26,8 +26,10 @@ MASTER_ENC_KEY = base64.b64decode(os.environ["ENC_KEY_BASE64"])
 class SecureReIDStorage:
     def __init__(self):
         mongo_host_url = os.environ["MONGO_HOST_URL"]
-        mongo_user = os.environ["MONGO_ROOT_USERNAME"]
-        mongo_pass = os.environ["MONGO_ROOT_PASSWORD"]
+        mongo_user = os.environ["MONGO_ROOT_USERNAME"].strip()
+        mongo_pass = os.environ["MONGO_ROOT_PASSWORD"].strip()
+
+        print(f" user name: {mongo_user} and pass: {mongo_pass}" )
         mongo_db_url = f"mongodb://{mongo_user}:{mongo_pass}@{mongo_host_url}"
         # mongo_db_url = os.getenv("MONGO_HOST_URL", "mongodb://localhost:27017")
         print(f"Connecting to MongoDB at {mongo_db_url}...")

@@ -1,6 +1,6 @@
 
 
-
+export ENC_KEY_BASE64="$(python -c "import os, base64; print(base64.b64encode(os.urandom(32)).decode())")"
 export MONGO_HOST_URL="localhost:27017"
 export MONGO_ROOT_USERNAME="admin"
 export MONGO_ROOT_PASSWORD="secret123"

@@ -126,3 +126,25 @@ Similarly, you can run only `python main.py` as well.
 
 
 
+next work:
+
+
+1. 4 switch 
+2. 2 different flows from same camera (feature data and image data)
+
+
+possible ideas: 
+
+1. multiple camera to same edge node 
+
+2. 2 different flows from same camera (feature data and image data)
+
+
+3. learning based GCL schedule 
+
+4. encryption at the endge nod e
+
+5. applciation specific traffic 
+
+
+

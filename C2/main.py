@@ -63,7 +63,7 @@ class TSNReceiver:
 class TransReIDProcessor:
     def __init__(
         self,
-        model_path="/home/jdg24001/Documents/github/Secure-Camera/weights-models/weights/transformer_best.pth",
+        model_path="/home/jdg24001/Documents/github/Secure-Camera/weights-models/transformer_best.pth",
         config_path="/home/jdg24001/Documents/github/Secure-Camera/weights-models/vit_transreid_stride.yml",
     ):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -131,7 +131,14 @@ class TransReIDProcessor:
     def extract_features(self, person_images):
         if self.model is None:
             print("⚠️ TransReID model not loaded, using fallback normalization")
-            return torch.nn.functional.normalize(person_images, dim=1, p=2)
+            # return torch.nn.functional.normalize(person_images, dim=1, p=2)
+
+            pooled = person_images.mean(dim=(2, 3))
+
+            # optional: repeat to make a slightly larger vector, e.g. 384 dims
+            pooled = pooled.repeat(1, 128)   # [N, 384]
+
+            return torch.nn.functional.normalize(pooled, dim=1, p=2)
 
         try:
             with torch.no_grad():
@@ -150,7 +157,11 @@ class TransReIDProcessor:
                 return features.cpu()
         except Exception as e:
             print(f"⚠️ Feature extraction fallback due to error: {e}")
-            return torch.nn.functional.normalize(person_images, dim=1, p=2)
+            # return torch.nn.functional.normalize(person_images, dim=1, p=2)
+
+            pooled = torch.nn.functional.adaptive_avg_pool2d(person_images, (16, 16))
+            pooled = pooled.flatten(start_dim=1)
+            return torch.nn.functional.normalize(pooled, dim=1, p=2)
 
 
 class WeaviateReIDManager:

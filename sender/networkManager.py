@@ -105,11 +105,31 @@ class NetworkManager:
 
         max_single_payload = MAX_DGRAM - HEADER_SIZE
 
+        # print(
+        #     f"[DEBUG] type={payload.get('type', 'unknown')}, "
+        #     f"raw={len(raw)} bytes, compressed={len(compressed)} bytes, "
+        #     f"vlan={self.vlan_id}, iface={self.interface_name}"
+        # )
+
+        metadata = payload.get("metadata", {})
+        payload_type = payload.get("type", "unknown")
+        frame_id = metadata.get("frame_id", "NA")
+        num_objects = metadata.get("num_objects", len(payload.get("objects", [])))
+
         print(
-            f"[DEBUG] type={payload.get('type', 'unknown')}, "
-            f"raw={len(raw)} bytes, compressed={len(compressed)} bytes, "
-            f"vlan={self.vlan_id}, iface={self.interface_name}"
+            f"[TX] type={payload_type} "
+            f"frame_id={frame_id} "
+            f"objects={num_objects} "
+            f"vlan={self.vlan_id} "
+            f"prio={self.priority} "
+            f"iface={self.interface_name} "
+            f"dest={self.dest_ip}:{self.dest_port} "
+            f"raw={len(raw)}B "
+            f"compressed={len(compressed)}B"
         )
+
+
+
 
         if len(compressed) <= max_single_payload:
             self._send_single_packet(compressed)
@@ -133,9 +153,18 @@ class NetworkManager:
         packet = header + compressed
         self.send_data(packet)
 
+        # print(
+        #     f"[SENT SINGLE] message_id={message_id}, "
+        #     f"size={len(packet)} bytes, vlan={self.vlan_id}"
+        # )
+
         print(
-            f"[SENT SINGLE] message_id={message_id}, "
-            f"size={len(packet)} bytes, vlan={self.vlan_id}"
+            f"[TX-SINGLE] message_id={message_id} "
+            f"vlan={self.vlan_id} "
+            f"prio={self.priority} "
+            f"iface={self.interface_name} "
+            f"dest={self.dest_ip}:{self.dest_port} "
+            f"packet_size={len(packet)}B"
         )
 
     def _send_chunked_packets(self, compressed: bytes, payload: dict):
@@ -146,12 +175,32 @@ class NetworkManager:
         max_chunk_payload = MAX_DGRAM - HEADER_SIZE
         total_chunks = (len(compressed) + max_chunk_payload - 1) // max_chunk_payload
 
+        # print(
+        #     f"[CHUNKING] message_id={message_id}, "
+        #     f"type={payload.get('type', 'unknown')}, "
+        #     f"compressed={len(compressed)} bytes, chunks={total_chunks}, "
+        #     f"vlan={self.vlan_id}, iface={self.interface_name}"
+        # )
+
+        metadata = payload.get("metadata", {})
+        payload_type = payload.get("type", "unknown")
+        frame_id = metadata.get("frame_id", "NA")
+        num_objects = metadata.get("num_objects", len(payload.get("objects", [])))
+
         print(
-            f"[CHUNKING] message_id={message_id}, "
-            f"type={payload.get('type', 'unknown')}, "
-            f"compressed={len(compressed)} bytes, chunks={total_chunks}, "
-            f"vlan={self.vlan_id}, iface={self.interface_name}"
+            f"[TX-CHUNKING] type={payload_type} "
+            f"frame_id={frame_id} "
+            f"objects={num_objects} "
+            f"message_id={message_id} "
+            f"vlan={self.vlan_id} "
+            f"prio={self.priority} "
+            f"iface={self.interface_name} "
+            f"dest={self.dest_ip}:{self.dest_port} "
+            f"compressed={len(compressed)}B "
+            f"chunks={total_chunks}"
         )
+
+
 
         for chunk_index in range(total_chunks):
             start = chunk_index * max_chunk_payload
@@ -169,9 +218,18 @@ class NetworkManager:
             packet = header + chunk
             self.send_data(packet)
 
+        # print(
+        #     f"[SENT CHUNKED] message_id={message_id}, "
+        #     f"chunks={total_chunks}, vlan={self.vlan_id}"
+        # )
+
         print(
-            f"[SENT CHUNKED] message_id={message_id}, "
-            f"chunks={total_chunks}, vlan={self.vlan_id}"
+            f"[TX-CHUNKED] message_id={message_id} "
+            f"chunks={total_chunks} "
+            f"vlan={self.vlan_id} "
+            f"prio={self.priority} "
+            f"iface={self.interface_name} "
+            f"dest={self.dest_ip}:{self.dest_port}"
         )
 
     def close(self):

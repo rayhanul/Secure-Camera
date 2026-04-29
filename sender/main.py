@@ -275,14 +275,17 @@ def main():
                         "timestamp": datetime.now().isoformat(),
                         "vlan_id": args.frame_vlan_id,
                         "vlan_interface": args.frame_vlan_interface,
+                        "priority": args.frame_priority,
                     },
                     "frame_jpg_b64": frame_b64,
                 }
 
                 print(
-                    f"[FRAME] frame_id={frame_id}, "
-                    f"VLAN={args.frame_vlan_id}, "
-                    f"iface={args.frame_vlan_interface}, "
+                    f"[Frame] type=raw_frame "
+                    f"frame_id={frame_id} "
+                    f"vlan={args.frame_vlan_id} "
+                    f"prio={args.frame_priority} "
+                    f"iface={args.frame_vlan_interface} "
                     f"dest={args.frame_dest_ip}"
                 )
 
@@ -292,12 +295,15 @@ def main():
             payload["metadata"]["payload_type"] = "detected_objects"
             payload["metadata"]["vlan_id"] = args.object_vlan_id
             payload["metadata"]["vlan_interface"] = args.object_vlan_interface
+            payload["metadata"]["priority"] = args.object_priority 
 
             print(
-                f"[OBJECTS] frame_id={frame_id}, "
-                f"detected_objects={len(payload['objects'])}, "
-                f"VLAN={args.object_vlan_id}, "
-                f"iface={args.object_vlan_interface}, "
+                f"[OBJECTS] type=detected_objects "
+                f"frame_id={frame_id} "
+                f"objects={len(payload['objects'])} "
+                f"vlan={args.object_vlan_id} "
+                f"prio={args.object_priority} "
+                f"iface={args.object_vlan_interface} "
                 f"dest={args.object_dest_ip}"
             )
 

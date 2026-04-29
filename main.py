@@ -111,16 +111,30 @@ def parse_args():
     parser.add_argument("--camera_index", type=int, default=0, help="Camera index")
     parser.add_argument("--save_dir", type=str, default="captured_frames", help="Directory to save captured video/frames")
     parser.add_argument("--model_path", type=str, default="/home/ubuntu/Documents/secure-camera/models/yolov8n.pt", help="Path to YOLO model")
-    parser.add_argument("--dest_ip", type=str, default="192.168.10.11", help="Receiver IP")
+    # parser.add_argument("--dest_ip", type=str, default="192.168.10.11", help="Receiver IP")
     parser.add_argument("--dest_port", type=int, default=12345, help="Receiver UDP port")
-    parser.add_argument("--priority", type=int, default=7, help="Socket priority for TSN/PCP mapping")
-    parser.add_argument("--interface_name", type=str, default=None, help="Optional interface name, e.g. enp1s0.10")
+    # parser.add_argument("--priority", type=int, default=7, help="Socket priority for TSN/PCP mapping")
+    # parser.add_argument("--interface_name", type=str, default=None, help="Optional interface name, e.g. enp1s0.10")
     parser.add_argument("--camera_id", type=str, default="cam_1", help="Camera ID in metadata")
     parser.add_argument("--conf_threshold", type=float, default=0.5, help="YOLO confidence threshold")
     parser.add_argument("--jpeg_quality", type=int, default=70, help="JPEG quality for transmitted crops")
     parser.add_argument("--save_images", action="store_true", default=False, help="Save processed objects under /tmp/processed_objects")
     parser.add_argument("--save_annotated_every", type=int, default=30, help="Save annotated frame every N frames; 0 disables")
     parser.add_argument("--send_empty", action="store_true", default=True, help="Send metadata even when no object is detected")
+    
+    
+    # route for raw captured frames
+    parser.add_argument("--frame_vlan_interface", type=str, default="enp1s0.10")
+    parser.add_argument("--frame_dest_ip", type=str, default="192.168.10.11")
+    parser.add_argument("--frame_vlan_id", type=int, default=10)
+    parser.add_argument("--frame_priority", type=int, default=7)
+
+    # route for YOLO detected objects
+    parser.add_argument("--object_vlan_interface", type=str, default="enp1s0.20")
+    parser.add_argument("--object_dest_ip", type=str, default="192.168.20.11")
+    parser.add_argument("--object_vlan_id", type=int, default=20)
+    parser.add_argument("--object_priority", type=int, default=7)
+    
     return parser.parse_args()
 
 
@@ -133,7 +147,8 @@ def main():
     print("=====================")
 
     camera = CameraManager(camera_index=args.camera_index, save_dir=args.save_dir)
-    network = None
+    frame_network = None
+    object_network = None 
     frame_id = 0
     video_writer = None
 
@@ -144,11 +159,39 @@ def main():
     )
 
     try:
-        network = NetworkManager(
-            dest_ip=args.dest_ip,
+        # network = NetworkManager(
+        #     dest_ip=args.dest_ip,
+        #     dest_port=args.dest_port,
+        #     priority=args.priority,
+        #     interface_name=args.interface_name,
+        # )
+
+        # VLAN 10 route for captured frame
+        frame_network = NetworkManager(
+            dest_ip=args.frame_dest_ip,
             dest_port=args.dest_port,
-            priority=args.priority,
-            interface_name=args.interface_name,
+            priority=args.frame_priority,
+            interface_name=args.frame_vlan_interface,
+            vlan_id=args.frame_vlan_id,
+        )
+
+        # VLAN 20 route for detected objects
+        object_network = NetworkManager(
+            dest_ip=args.object_dest_ip,
+            dest_port=args.dest_port,
+            priority=args.object_priority,
+            interface_name=args.object_vlan_interface,
+            vlan_id=args.object_vlan_id,
+        )
+
+        print(
+            f"✅ Frame route: VLAN={args.frame_vlan_id}, "
+            f"iface={args.frame_vlan_interface}, dest={args.frame_dest_ip}"
+        )
+
+        print(
+            f"✅ Object route: VLAN={args.object_vlan_id}, "
+            f"iface={args.object_vlan_interface}, dest={args.object_dest_ip}"
         )
 
         width, height, fps = camera.get_frame_size()
@@ -162,6 +205,40 @@ def main():
             raise RuntimeError(f"Could not open video writer for {video_path}")
 
         print("Recording video, running YOLO, and sending detections to server. Press Ctrl+C to stop.")
+
+        # while True:
+        #     frame = camera.get_frame()
+        #     video_writer.write(frame)
+
+        #     payload, results = processor.process_frame(
+        #         frame=frame,
+        #         frame_id=frame_id,
+        #         camera_id=args.camera_id,
+        #         save_images=args.save_images,
+        #     )
+
+        #     annotated = draw_boxes(frame, results)
+
+        #     if args.save_annotated_every > 0 and frame_id % args.save_annotated_every == 0:
+        #         jpg_name = os.path.join(args.save_dir, f"frame_{frame_id}.jpg")
+        #         cv2.imwrite(jpg_name, annotated)
+
+        #     print(
+        #         f"[SENDING] frame_id={frame_id}, detected_objects={len(payload['objects'])}"
+        #     )
+
+        #     if payload["objects"]:
+        #         # safest for UDP: one object per packet
+        #         for obj in payload["objects"]:
+        #             small_payload = {
+        #                 "metadata": payload["metadata"],
+        #                 "objects": [obj],
+        #             }
+        #             network.send_json(small_payload)
+        #     elif args.send_empty:
+        #         network.send_json(payload)
+
+        #     frame_id += 1
 
         while True:
             frame = camera.get_frame()
@@ -180,22 +257,70 @@ def main():
                 jpg_name = os.path.join(args.save_dir, f"frame_{frame_id}.jpg")
                 cv2.imwrite(jpg_name, annotated)
 
+            # Send raw captured frame through VLAN 10 / frame route
+            success, frame_buf = cv2.imencode(
+                ".jpg",
+                frame,
+                [int(cv2.IMWRITE_JPEG_QUALITY), args.jpeg_quality],
+            )
+
+            if success:
+                frame_b64 = base64.b64encode(frame_buf.tobytes()).decode("utf-8")
+
+                frame_payload = {
+                    "type": "raw_frame",
+                    "metadata": {
+                        "frame_id": frame_id,
+                        "camera_id": args.camera_id,
+                        "timestamp": datetime.now().isoformat(),
+                        "vlan_id": args.frame_vlan_id,
+                        "vlan_interface": args.frame_vlan_interface,
+                    },
+                    "frame_jpg_b64": frame_b64,
+                }
+
+                print(
+                    f"[FRAME] frame_id={frame_id}, "
+                    f"VLAN={args.frame_vlan_id}, "
+                    f"iface={args.frame_vlan_interface}, "
+                    f"dest={args.frame_dest_ip}"
+                )
+
+                frame_network.send_json(frame_payload)
+
+            # Send YOLO detected objects through VLAN 20 / object route
+            payload["metadata"]["payload_type"] = "detected_objects"
+            payload["metadata"]["vlan_id"] = args.object_vlan_id
+            payload["metadata"]["vlan_interface"] = args.object_vlan_interface
+
             print(
-                f"[SENDING] frame_id={frame_id}, detected_objects={len(payload['objects'])}"
+                f"[OBJECTS] frame_id={frame_id}, "
+                f"detected_objects={len(payload['objects'])}, "
+                f"VLAN={args.object_vlan_id}, "
+                f"iface={args.object_vlan_interface}, "
+                f"dest={args.object_dest_ip}"
             )
 
             if payload["objects"]:
-                # safest for UDP: one object per packet
                 for obj in payload["objects"]:
-                    small_payload = {
+                    object_payload = {
+                        "type": "detected_objects",
                         "metadata": payload["metadata"],
                         "objects": [obj],
                     }
-                    network.send_json(small_payload)
+                    object_network.send_json(object_payload)
             elif args.send_empty:
-                network.send_json(payload)
+                object_network.send_json(
+                    {
+                        "type": "detected_objects",
+                        "metadata": payload["metadata"],
+                        "objects": [],
+                    }
+                )
 
             frame_id += 1
+
+
 
     except PermissionError:
         print("Error: run with sudo if SO_PRIORITY requires elevated permission.")
@@ -208,8 +333,15 @@ def main():
             video_writer.release()
             print("Video saved.")
 
-        if network is not None:
-            network.close()
+        # if network is not None:
+        #     network.close()
+
+        # Close both VLAN sockets
+        if "frame_network" in locals() and frame_network is not None:
+            frame_network.close()
+
+        if "object_network" in locals() and object_network is not None:
+            object_network.close()
 
 
 if __name__ == "__main__":

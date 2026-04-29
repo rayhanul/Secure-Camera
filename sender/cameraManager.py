@@ -3,10 +3,16 @@ import os
 import time
 from datetime import datetime
 
+
+
+
+
+
 class CameraManager:
-    def __init__(self, camera_index=0, save_dir="captured_frames"):
+    def __init__(self, camera_index=0, frame_interval=30, save_dir="captured_frames"):
         self.camera_index = camera_index
         self.save_dir = save_dir
+        self.frame_interval = frame_interval
         os.makedirs(self.save_dir, exist_ok=True)
 
         self.cap = cv2.VideoCapture(self.camera_index)

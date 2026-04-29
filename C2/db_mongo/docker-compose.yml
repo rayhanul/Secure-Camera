@@ -1,0 +1,57 @@
+# version: "3.8"
+
+# services:
+#   mongodb:
+#     image: mongo:7
+#     container_name: mongodb
+#     restart: unless-stopped
+#     ports:
+#       - "27017:27017"
+#     volumes:
+#       - mongodb_data:/data/db
+#     environment:
+#       MONGO_INITDB_ROOT_USERNAME: admin
+#       MONGO_INITDB_ROOT_PASSWORD: securepassword123
+#       MONGO_INITDB_DATABASE: reid_db
+#     command: ["mongod", "--bind_ip_all"]
+
+#   weaviate:
+#     image: semitechnologies/weaviate:latest
+#     depends_on:
+#       - mongodb
+#     ports:
+#       - "8080:8080"
+#       - "50051:50051"
+#     environment:
+#       AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
+#       PERSISTENCE_DATA_PATH: "/var/lib/weaviate"
+#       DEFAULT_VECTORIZER_MODULE: "none"
+
+# volumes:
+#   mongodb_data:
+
+
+
+version: "3.8"
+
+services:
+  mongodb:
+    image: mongo:7
+    container_name: mongodb
+    restart: unless-stopped
+
+    ports:
+      - "27017:27017"
+
+    volumes:
+      - mongodb_data:/data/db
+
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: secret123
+      MONGO_INITDB_DATABASE: reid_db
+
+    command: ["mongod", "--bind_ip_all"]
+
+volumes:
+  mongodb_data:

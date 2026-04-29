@@ -185,12 +185,12 @@ def main():
         )
 
         print(
-            f"✅ Frame route: VLAN={args.frame_vlan_id}, "
+            f"Frame route: VLAN={args.frame_vlan_id}, "
             f"iface={args.frame_vlan_interface}, dest={args.frame_dest_ip}"
         )
 
         print(
-            f"✅ Object route: VLAN={args.object_vlan_id}, "
+            f"Object route: VLAN={args.object_vlan_id}, "
             f"iface={args.object_vlan_interface}, dest={args.object_dest_ip}"
         )
 
@@ -296,11 +296,12 @@ def main():
             payload["metadata"]["vlan_id"] = args.object_vlan_id
             payload["metadata"]["vlan_interface"] = args.object_vlan_interface
             payload["metadata"]["priority"] = args.object_priority 
+            payload["metadata"]["num_objects"] = len(payload["objects"])
 
             print(
                 f"[OBJECTS] type=detected_objects "
                 f"frame_id={frame_id} "
-                f"objects={len(payload['objects'])} "
+                f"detected objects={len(payload['objects'])} "
                 f"vlan={args.object_vlan_id} "
                 f"prio={args.object_priority} "
                 f"iface={args.object_vlan_interface} "
@@ -339,8 +340,6 @@ def main():
             video_writer.release()
             print("Video saved.")
 
-        # if network is not None:
-        #     network.close()
 
         # Close both VLAN sockets
         if "frame_network" in locals() and frame_network is not None:

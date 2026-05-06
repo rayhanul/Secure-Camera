@@ -115,10 +115,11 @@ class NetworkManager:
         payload_type = payload.get("type", "unknown")
         frame_id = metadata.get("frame_id", "NA")
         num_objects = metadata.get("num_objects", len(payload.get("objects", [])))
+        camera_location = metadata.get("camera_location", "NA")
 
         print(
             f"[TX] type={payload_type} "
-            f"camera={args.camera_location} "
+            f"camera={camera_location} "
             f"frame_id={frame_id} "
             f"objects={num_objects} "
             f"vlan={self.vlan_id} "

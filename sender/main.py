@@ -112,6 +112,8 @@ def parse_args():
     parser.add_argument("--camera_id", type=str, default="cam_1", help="Camera ID in metadata")
     parser.add_argument("--camera_location", type=str, default="desk-1", help="Camera location in metadata")
 
+    parser.add_argument("--frame_interval", type=int, default=2, help="frame interval in seconds")
+
     # parser.add_argument("--edge_node_id", type=str, default="edge_1")
     # parser.add_argument("--edge_node_ip", type=str, default="192.168.10.10")
     
@@ -153,7 +155,7 @@ def main():
         print(f"{k}: {v}")
     print("=====================")
 
-    camera = CameraManager(camera_index=args.camera_index, save_dir=args.save_dir)
+    camera = CameraManager(camera_index=args.camera_index, frame_interval=args.frame_interval, save_dir=args.save_dir)
     frame_network = None
     object_network = None 
     frame_id = 0
@@ -339,6 +341,8 @@ def main():
                 )
 
             frame_id += 1
+            print(f"\n========== FRAME {frame_id} ==========")
+            time.sleep(camera.frame_interval)
 
 
 

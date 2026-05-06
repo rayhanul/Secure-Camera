@@ -110,7 +110,7 @@ class FrameProcessor:
 
         return cropped, processed
 
-    def process_frame(self, frame, frame_id, camera_id="cam_1", save_images=False):
+    def process_frame(self, frame, frame_id, camera_id="cam_1", camera_location="unknown", save_images=False):
         """Detect and build payload-ready objects."""
         detections, results = self.detect_objects(frame)
         processed_objects = []
@@ -161,6 +161,7 @@ class FrameProcessor:
         metadata = {
             "frame_id": frame_id,
             "camera_id": camera_id,
+            "camera_location": camera_location,
             "timestamp": datetime.now().isoformat(),
         }
 

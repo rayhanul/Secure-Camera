@@ -9,8 +9,9 @@ from datetime import datetime
 
 
 class CameraManager:
-    def __init__(self, camera_index=0, frame_interval=30, save_dir="captured_frames"):
+    def __init__(self, camera_index=0, camera_location="unknown", frame_interval=30, save_dir="captured_frames"):
         self.camera_index = camera_index
+        self.camera_location = camera_location
         self.save_dir = save_dir
         self.frame_interval = frame_interval
         os.makedirs(self.save_dir, exist_ok=True)
@@ -19,7 +20,7 @@ class CameraManager:
         if not self.cap.isOpened():
             raise RuntimeError(f"Error: cannot open camera with index {self.camera_index}")
 
-        print(f"Camera {self.camera_index} initialized.")
+        print(f"Camera {self.camera_index} at location {self.camera_location} is initialized.")
 
     def get_frame(self):
         ret, frame = self.cap.read()

@@ -109,13 +109,20 @@ def parse_args():
         description="Continuous camera capture, YOLO detection, and TSN/UDP sender"
     )
     parser.add_argument("--camera_index", type=int, default=0, help="Camera index")
+    parser.add_argument("--camera_id", type=str, default="cam_1", help="Camera ID in metadata")
+    parser.add_argument("--camera_location", type=str, default="desk-1", help="Camera location in metadata")
+
+    # parser.add_argument("--edge_node_id", type=str, default="edge_1")
+    # parser.add_argument("--edge_node_ip", type=str, default="192.168.10.10")
+    
+
     parser.add_argument("--save_dir", type=str, default="captured_frames", help="Directory to save captured video/frames")
     parser.add_argument("--model_path", type=str, default="/home/ubuntu/Documents/secure-camera/models/yolov8n.pt", help="Path to YOLO model")
     # parser.add_argument("--dest_ip", type=str, default="192.168.10.11", help="Receiver IP")
     parser.add_argument("--dest_port", type=int, default=12345, help="Receiver UDP port")
     # parser.add_argument("--priority", type=int, default=7, help="Socket priority for TSN/PCP mapping")
     # parser.add_argument("--interface_name", type=str, default=None, help="Optional interface name, e.g. enp1s0.10")
-    parser.add_argument("--camera_id", type=str, default="cam_1", help="Camera ID in metadata")
+    
     parser.add_argument("--conf_threshold", type=float, default=0.5, help="YOLO confidence threshold")
     parser.add_argument("--jpeg_quality", type=int, default=70, help="JPEG quality for transmitted crops")
     parser.add_argument("--save_images", action="store_true", default=False, help="Save processed objects under /tmp/processed_objects")
@@ -248,6 +255,7 @@ def main():
                 frame=frame,
                 frame_id=frame_id,
                 camera_id=args.camera_id,
+                camera_location=args.camera_location,
                 save_images=args.save_images,
             )
 
@@ -272,6 +280,7 @@ def main():
                     "metadata": {
                         "frame_id": frame_id,
                         "camera_id": args.camera_id,
+                        "camera_location": args.camera_location,
                         "timestamp": datetime.now().isoformat(),
                         "vlan_id": args.frame_vlan_id,
                         "vlan_interface": args.frame_vlan_interface,
@@ -286,7 +295,8 @@ def main():
                     f"vlan={args.frame_vlan_id} "
                     f"prio={args.frame_priority} "
                     f"iface={args.frame_vlan_interface} "
-                    f"dest={args.frame_dest_ip}"
+                    f"dest={args.frame_dest_ip}",
+                    f"camera_location={args.camera_location}",
                 )
 
                 frame_network.send_json(frame_payload)
@@ -297,6 +307,8 @@ def main():
             payload["metadata"]["vlan_interface"] = args.object_vlan_interface
             payload["metadata"]["priority"] = args.object_priority 
             payload["metadata"]["num_objects"] = len(payload["objects"])
+            payload["metadata"]["camera_location"] = args.camera_location
+
 
             print(
                 f"[OBJECTS] type=detected_objects "
@@ -305,7 +317,8 @@ def main():
                 f"vlan={args.object_vlan_id} "
                 f"prio={args.object_priority} "
                 f"iface={args.object_vlan_interface} "
-                f"dest={args.object_dest_ip}"
+                f"dest={args.object_dest_ip}",
+                f"camera_location={args.camera_location}",
             )
 
             if payload["objects"]:

@@ -270,6 +270,7 @@ class WeaviateReIDManager:
                 person_feature,
                 obj.get("class_name", "person"),
                 objects_data["metadata"]["camera_id"],
+                objects_data["metadata"]["camera_location"],
             )
 
             person_identity = self.determine_identity(
@@ -288,6 +289,7 @@ class WeaviateReIDManager:
                 "similar_detections": len(similar_persons),
                 "bbox": obj.get("bbox", [0, 0, 0, 0]),
                 "camera_id": objects_data["metadata"]["camera_id"],
+                "camera_location": objects_data["metadata"]["camera_location"],
                 "frame_id": objects_data["metadata"]["frame_id"],
                 "timestamp": objects_data["metadata"]["timestamp"],
                 "cross_camera_matches": person_identity.get("cross_camera_matches", []),
@@ -399,6 +401,7 @@ class WeaviateReIDManager:
                 confidence=float(obj.get("confidence", 0.0)),
                 bbox=obj.get("bbox", [0, 0, 0, 0]),
                 camera_id=str(objects_data["metadata"].get("camera_id", "unknown")),
+                camera_location=str(objects_data["metadata"].get("camera_location", "unknown")),
                 frame_id=int(objects_data["metadata"].get("frame_id", 0)),
                 timestamp=str(objects_data["metadata"].get("timestamp", 0)),
                 embedding_method="TransReID",
@@ -509,7 +512,8 @@ class C2Processor:
 
             frame_id = data["metadata"].get("frame_id", "unknown")
             camera_id = data["metadata"].get("camera_id", "unknown")
-            print(f"Processing frame {frame_id} from camera {camera_id}")
+            camera_location = data["metadata"].get("camera_location", "unknown")
+            print(f"Processing frame {frame_id} from camera {camera_id} at location {camera_location}")
 
             valid_objects = [
                 obj for obj in data.get("objects", [])
@@ -547,6 +551,7 @@ class C2Processor:
         payload_type = data.get("type") or metadata.get("payload_type", "unknown")
         frame_id = metadata.get("frame_id", "NA")
         camera_id = metadata.get("camera_id", "NA")
+        camera_location = metadata.get("camera_location", "unknown")
         vlan_id = metadata.get("vlan_id", "NA")
         vlan_interface = metadata.get("vlan_interface", "NA")
         source_addr = data.get("_source_addr", "NA")
@@ -557,6 +562,7 @@ class C2Processor:
             f"type={payload_type} "
             f"frame_id={frame_id} "
             f"camera={camera_id} "
+            f"location={camera_location} "
             f"objects={num_objects} "
             f"vlan={vlan_id} "
             f"iface={vlan_interface} "
@@ -569,7 +575,7 @@ class C2Processor:
             metadata = data.get("metadata", {})
             frame_id = metadata.get("frame_id", "unknown")
             camera_id = metadata.get("camera_id", "unknown")
-
+            camera_location = metadata.get("camera_location", "unknown")
             frame_b64 = data.get("frame_jpg_b64")
             if not frame_b64:
                 print(f"Raw frame packet missing frame_jpg_b64, frame_id={frame_id}")
@@ -583,12 +589,28 @@ class C2Processor:
                 print(f"Could not decode raw frame, frame_id={frame_id}")
                 return
 
+            doc = {
+                "frame_id": frame_id,
+                "camera_id": camera_id,
+                "camera_location": camera_location,
+                "timestamp": metadata.get("timestamp"),
+                "image_format": "jpg",
+                "image_bytes": frame_bytes,
+            }
+            
+            try:
+                mongo_id = self.weaviate_manager.mongo_storage.store_raw_frame_doc(doc)
+            except Exception as e:
+                print(f"Error storing raw frame doc in MongoDB: {e}")
+                mongo_id = None
+    
+    
             save_dir = "received_raw_frames"
             os.makedirs(save_dir, exist_ok=True)
 
             filename = os.path.join(
                 save_dir,
-                f"{camera_id}_frame_{frame_id}.jpg",
+                f"{camera_location}_{camera_id}_frame_{frame_id}.jpg",
             )
 
             cv2.imwrite(filename, frame)
@@ -689,6 +711,7 @@ class C2Processor:
         try:
             frame_id = str(data["metadata"].get("frame_id", "unknown"))
             camera_id = str(data["metadata"].get("camera_id", "unknown"))
+            camera_location = str(data["metadata"].get("camera_location", "unknown"))
 
             if not self.results_saver:
                 print("Results saver not initialized.")
@@ -765,7 +788,7 @@ class C2Processor:
                     except Exception as e:
                         print(f"Error getting similar embeddings from Weaviate: {e}")
 
-                query_name = f"person_{person_id}_frame_{frame_id}_cam_{camera_id}"
+                query_name = f"person_{person_id}_frame_{frame_id}_cam_{camera_id}_location_{camera_location}"
 
                 try:
                     saver.save_query_results_with_image(
@@ -773,6 +796,7 @@ class C2Processor:
                         similar_embeddings=similar_embeddings,
                         query_name=query_name,
                         camera_id=camera_id,
+                        camera_location=camera_location,
                         frame_id=frame_id,
                         query_image_data=query_image_data,
                     )
@@ -808,11 +832,28 @@ def parse_args():
         type=str,
         default="/home/jdg24001/Documents/github/Secure-Camera/weights-models/weights/transformer_best.pth",
     )
-    parser.add_argument("--similarity_threshold", type=float, default=0.7)
-    parser.add_argument("--save_results", action="store_true")
-    parser.add_argument("--save_json", action="store_true")
-    parser.add_argument("--store_crops", action="store_true")
-    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--similarity_threshold",
+        type=float,
+        default=0.7,
+        help="Similarity threshold for person matching",
+    )
+    
+    parser.add_argument(
+        "--save_results", action="store_true", help="Save processing results to file"
+    )
+    parser.add_argument(
+        "--save_json", action="store_true", help="Save reid_results JSON files"
+    )
+    parser.add_argument(
+        "--store_crops",
+        action="store_true",
+        help="Store image crops in Weaviate as base64",
+    )
+    parser.add_argument(
+        "--verbose", action="store_true", help="Enable verbose debug output"
+    )
+
     return parser.parse_args()
 
 

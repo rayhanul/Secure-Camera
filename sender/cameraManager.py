@@ -9,7 +9,7 @@ from datetime import datetime
 
 
 class CameraManager:
-    def __init__(self, camera_index=0, camera_location="unknown", frame_interval=30, save_dir="captured_frames"):
+    def __init__(self, camera_index=0, camera_location="unknown", frame_interval=10, save_dir="captured_frames"):
         self.camera_index = camera_index
         self.camera_location = camera_location
         self.save_dir = save_dir

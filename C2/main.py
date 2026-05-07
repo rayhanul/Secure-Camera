@@ -535,6 +535,8 @@ class C2Processor:
             reid_results = self.weaviate_manager.process_and_identify(
                 data, reid_features
             )
+            
+            self.display_results(reid_results)
 
             if self.args.save_results:
                 self.save_simple_results(data, reid_results)
@@ -695,7 +697,27 @@ class C2Processor:
                 continue
 
 
+    def display_results(self, results: List[Dict]):
+        print(f"\nReID Results ({len(results)} persons detected):")
+        print("-" * 80)
 
+        for result in results:
+            status = "NEW" if result.get("is_new_person") else "EXISTING"
+            cross_cam = (
+                f", {len(result.get('cross_camera_matches', []))} cross-camera"
+                if result.get("cross_camera_matches")
+                else ""
+            )
+            print(
+                f"{status} | ID: {result.get('person_id')} | "
+                f"Conf: {float(result.get('confidence', 0.0)):.3f} | "
+                f"Camera: {result.get('camera_id')} | "
+                f"Similar: {result.get('similar_detections', 0)}{cross_cam}"
+            )
+
+        print("-" * 80)
+        
+        
     def save_results_summary(self, results: List[Dict]):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"reid_results_{timestamp}.json"

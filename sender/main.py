@@ -16,6 +16,7 @@ from ultralytics import YOLO
 from cameraManager import CameraManager
 from networkManager import NetworkManager
 from FrameProcessor import FrameProcessor
+from videoManager import VideoManager
 
 
 
@@ -143,8 +144,40 @@ def parse_args():
     parser.add_argument("--object_dest_ip", type=str, default="192.168.20.11")
     parser.add_argument("--object_vlan_id", type=int, default=20)
     parser.add_argument("--object_priority", type=int, default=7)
+
+
+    parser.add_argument(
+        "--input_type",
+        type=str,
+        default="camera",
+        choices=["camera", "video"],
+        help="Select input source: camera or video",
+    )
+
+    parser.add_argument(
+        "--video_path",
+        type=str,
+        default=None,
+        help="Path to video file when input_type=video",
+    )
     
     return parser.parse_args()
+
+
+def get_input_metadata(args, input_source):
+    if args.input_type == "camera":
+        return {
+            "input_source": "camera",
+            "camera_index": args.camera_index,
+        }
+
+    if args.input_type == "video":
+        return input_source.get_source_metadata()
+
+    return {
+        "input_source": "unknown",
+    }
+
 
 
 def main():
@@ -155,7 +188,28 @@ def main():
         print(f"{k}: {v}")
     print("=====================")
 
-    camera = CameraManager(camera_index=args.camera_index, frame_interval=args.frame_interval, save_dir=args.save_dir)
+    # camera = CameraManager(camera_index=args.camera_index, frame_interval=args.frame_interval, save_dir=args.save_dir)
+    input_source=None 
+
+    if args.input_type == "camera":
+        input_source = CameraManager(
+            camera_index=args.camera_index,
+            frame_interval=args.frame_interval,
+            save_dir=args.save_dir,
+        )
+        print(f"Using camera input: camera_index={args.camera_index}")
+
+    elif args.input_type == "video":
+        if args.video_path is None:
+            raise ValueError("Please provide --video_path when input_type=video")
+
+        input_source = VideoManager(
+            video_path=args.video_path,
+            frame_interval=args.frame_interval,
+        )
+        print(f"Using video input: {args.video_path}")
+
+
     frame_network = None
     object_network = None 
     frame_id = 0
@@ -203,7 +257,8 @@ def main():
             f"iface={args.object_vlan_interface}, dest={args.object_dest_ip}"
         )
 
-        width, height, fps = camera.get_frame_size()
+        width, height, fps = input_source.get_frame_size() # select input source either camera/video depending on input 
+
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         video_path = os.path.join(args.save_dir, f"session_{timestamp}.avi")
 
@@ -250,7 +305,7 @@ def main():
         #     frame_id += 1
 
         while True:
-            frame = camera.get_frame()
+            frame = input_source.get_frame()
             video_writer.write(frame)
 
             payload, results = processor.process_frame(
@@ -277,6 +332,8 @@ def main():
             if success:
                 frame_b64 = base64.b64encode(frame_buf.tobytes()).decode("utf-8")
 
+                input_metadata = get_input_metadata(args, input_source)
+
                 frame_payload = {
                     "type": "raw_frame",
                     "metadata": {
@@ -287,6 +344,7 @@ def main():
                         "vlan_id": args.frame_vlan_id,
                         "vlan_interface": args.frame_vlan_interface,
                         "priority": args.frame_priority,
+                        **input_metadata,
                     },
                     "frame_jpg_b64": frame_b64,
                 }
@@ -294,14 +352,17 @@ def main():
                 print(
                     f"[Frame] type=raw_frame "
                     f"frame_id={frame_id} "
+                    f"source={args.input_type} "
                     f"vlan={args.frame_vlan_id} "
                     f"prio={args.frame_priority} "
                     f"iface={args.frame_vlan_interface} "
-                    f"dest={args.frame_dest_ip}",
-                    f"camera_location={args.camera_location}",
+                    f"dest={args.frame_dest_ip} "
+                    f"camera_location={args.camera_location}"
                 )
 
                 frame_network.send_json(frame_payload)
+
+            input_metadata = get_input_metadata(args, input_source)
 
             # Send YOLO detected objects through VLAN 20 / object route
             payload["metadata"]["payload_type"] = "detected_objects"
@@ -312,15 +373,20 @@ def main():
             payload["metadata"]["camera_location"] = args.camera_location
 
 
+            payload["metadata"].update(input_metadata)
+
+
+
             print(
                 f"[OBJECTS] type=detected_objects "
                 f"frame_id={frame_id} "
-                f"detected objects={len(payload['objects'])} "
+                f"source={args.input_type} "
+                f"detected_objects={len(payload['objects'])} "
                 f"vlan={args.object_vlan_id} "
                 f"prio={args.object_priority} "
                 f"iface={args.object_vlan_interface} "
-                f"dest={args.object_dest_ip}",
-                f"camera_location={args.camera_location}",
+                f"dest={args.object_dest_ip} "
+                f"camera_location={args.camera_location}"
             )
 
             if payload["objects"]:
@@ -342,7 +408,7 @@ def main():
 
             frame_id += 1
             print(f"\n========== FRAME {frame_id} ==========")
-            time.sleep(camera.frame_interval)
+            time.sleep(input_source.frame_interval)
 
 
 
@@ -351,7 +417,7 @@ def main():
     except KeyboardInterrupt:
         print("\nStopped by user.")
     finally:
-        camera.release()
+        input_source.release()
 
         if video_writer is not None:
             video_writer.release()

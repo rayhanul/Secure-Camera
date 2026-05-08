@@ -306,6 +306,12 @@ def main():
 
         while True:
             frame = input_source.get_frame()
+            
+            if frame is None:
+                print("No valid frame received. Video may be finished or unsupported codec.")
+                break
+
+
             video_writer.write(frame)
 
             payload, results = processor.process_frame(

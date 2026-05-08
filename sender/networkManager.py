@@ -191,7 +191,7 @@ class NetworkManager:
 
         print(
             f"[TX-CHUNKING] type={payload_type} "
-            f"camera={args.camera_location} "
+            f"camera={metadata.get('camera_location', metadata.get('camera_id', 'unknown'))} "
             f"frame_id={frame_id} "
             f"objects={num_objects} "
             f"message_id={message_id} "

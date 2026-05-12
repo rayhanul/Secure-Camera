@@ -269,8 +269,7 @@ class WeaviateReIDManager:
             similar_persons = self.find_similar_persons(
                 person_feature,
                 obj.get("class_name", "person"),
-                objects_data["metadata"]["camera_id"],
-                objects_data["metadata"]["camera_location"],
+                objects_data["metadata"]["camera_id"]
             )
 
             person_identity = self.determine_identity(

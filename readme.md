@@ -300,3 +300,15 @@ Because running this command:  ```tc -p -s -d qdisc show dev sw0ep``` shows only
 python main.py   --camera_index 0   --model_path /home/ubuntu/Documents/secure-camera/models/yolov8n.pt   --dest_ip 192.168.10.11   --dest_port 12345   --priority 7  
 
 ```
+
+
+
+```
+
+python main.py --input_type video --video_path sample.mp4 
+
+```
+
+
+
+

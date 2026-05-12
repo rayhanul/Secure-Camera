@@ -56,6 +56,8 @@ class ReIDVectorStore:
         print(f"✅ Weaviate ready: {self.client.is_ready()}")
         self.collection_name = collection_name
         self.setup_schema()
+        self.ensure_extra_properties()
+        
         print("📋 Schema setup complete")
 
     def close(self):
@@ -125,11 +127,11 @@ class ReIDVectorStore:
                     #     data_type=DataType.TEXT,
                     #     description="Feature extraction model used (e.g. TransReID, OSNet, etc.).",
                     # ),
-                    # Property(
-                    #     name="person_id",
-                    #     data_type=DataType.TEXT,
-                    #     description="Assigned person ID for ReID tracking.",
-                    # ),
+                    Property(
+                        name="person_id",
+                        data_type=DataType.TEXT,
+                        description="Assigned person ID for ReID tracking.",
+                    ),
                     Property(
                         name="reid_confidence",
                         data_type=DataType.NUMBER,
@@ -238,6 +240,47 @@ class ReIDVectorStore:
     #         print(f"❌ Error storing embeddings: {e}")
     #         return None
 
+
+    def ensure_extra_properties(self):
+        collection = self.client.collections.get(self.collection_name)
+        config = collection.config.get()
+        existing_props = {prop.name for prop in config.properties}
+
+        new_properties = []
+
+        if "person_id" not in existing_props:
+            new_properties.append(
+                Property(
+                    name="person_id",
+                    data_type=DataType.TEXT,
+                    description="Assigned ReID person identity.",
+                )
+            )
+
+        if "reid_confidence" not in existing_props:
+            new_properties.append(
+                Property(
+                    name="reid_confidence",
+                    data_type=DataType.NUMBER,
+                    description="Confidence score for ReID identity assignment.",
+                )
+            )
+
+        if "is_new_person" not in existing_props:
+            new_properties.append(
+                Property(
+                    name="is_new_person",
+                    data_type=DataType.BOOL,
+                    description="Whether this detection is a new person.",
+                )
+            )
+
+        for prop in new_properties:
+            collection.config.add_property(prop)
+            print(f"Added missing Weaviate property: {prop.name}")
+
+
+            
     def store_embeddings(self, objects_data: Dict, embeddings: torch.Tensor):
         """
         Store ReID embeddings with metadata in Weaviate

@@ -10,6 +10,7 @@ class ReIDResult:
     confidence: float
     bbox: List[int]  # [x1, y1, x2,
     camera_id: str
+    camera_location: str
     frame_id: int
     timestamp: str
     embedding_method: str

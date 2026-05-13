@@ -395,14 +395,37 @@ def main():
                 f"camera_location={args.camera_location}"
             )
 
+            # if payload["objects"]:
+            #     for obj in payload["objects"]:
+            #         object_payload = {
+            #             "type": "detected_objects",
+            #             "metadata": payload["metadata"],
+            #             "objects": [obj],
+            #         }
+            #         object_network.send_json(object_payload)
+            # elif args.send_empty:
+            #     object_network.send_json(
+            #         {
+            #             "type": "detected_objects",
+            #             "metadata": payload["metadata"],
+            #             "objects": [],
+            #         }
+            #     )
+
             if payload["objects"]:
-                for obj in payload["objects"]:
-                    object_payload = {
-                        "type": "detected_objects",
-                        "metadata": payload["metadata"],
-                        "objects": [obj],
-                    }
-                    object_network.send_json(object_payload)
+                object_payload = {
+                    "type": "detected_objects",
+                    "metadata": payload["metadata"],
+                    "objects": payload["objects"],   # send all objects together
+                }
+
+                print(
+                    f"[OBJECT PACKET SEND] frame_id={frame_id}, "
+                    f"objects_in_packet={len(object_payload['objects'])}"
+                )
+
+                object_network.send_json(object_payload)
+
             elif args.send_empty:
                 object_network.send_json(
                     {

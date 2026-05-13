@@ -21,7 +21,7 @@ class ReIDVectorStore:
     ):
         """
         Initialize Weaviate Client for ReID embeddings storage
-        """
+        """   
         # Try to get from environment variables first
         env_weaviate_url = os.environ.get("WEAVIATE_URL")
         weaviate_api_key = os.environ.get("WEAVIATE_API_KEY")
@@ -142,6 +142,13 @@ class ReIDVectorStore:
                         data_type=DataType.BOOL,
                         description="Whether this is a newly identified person.",
                     ),
+                    Property(name="camera_id", data_type=DataType.TEXT),
+                    
+                    Property(name="camera_location", data_type=DataType.TEXT),
+                    
+                    Property(name="frame_id", data_type=DataType.INT),
+
+
                     # Property(
                     #     name="image_crop_base64",
                     #     data_type=DataType.TEXT,
@@ -312,6 +319,8 @@ class ReIDVectorStore:
             for i, obj in enumerate(objects_data["objects"]):
                 # ✅ critical fix: flatten to 1D float list
                 embedding_vector = embeddings[i].astype(np.float32).flatten().tolist()
+                
+                metadata = objects_data.get("metadata", {})
 
                 timestamp_raw = objects_data["metadata"].get(
                     "timestamp", datetime.now().timestamp()
@@ -333,12 +342,38 @@ class ReIDVectorStore:
                         datetime.fromtimestamp(float(timestamp_raw)).isoformat() + "Z"
                     )
 
+                # data_object = {
+                #     "class_name": obj.get("class_name", "unknown"),
+                #     "timestamp": timestamp_iso,
+                #     "reid_confidence": float(obj.get("reid_confidence", 0.0)),
+                #     "is_new_person": bool(obj.get("is_new_person", True)),
+                # }
+                
                 data_object = {
-                    "class_name": obj.get("class_name", "unknown"),
+                    "class_name": obj.get("class_name", "person"),
+                    "person_id": obj.get("person_id", "unknown"),   # ADD THIS
                     "timestamp": timestamp_iso,
                     "reid_confidence": float(obj.get("reid_confidence", 0.0)),
                     "is_new_person": bool(obj.get("is_new_person", True)),
+                    
+                     # camera metadata
+                    "camera_id": str(metadata.get("camera_id", "unknown")),
+                    "camera_location": str(metadata.get("camera_location", "unknown")),
+                    "frame_id": int(metadata.get("frame_id", 0)),
+                    "timestamp": timestamp_iso,
+    
+    
                 }
+                
+                print(
+                    f"[STORE] person_id={data_object['person_id']} "
+                    f"camera={data_object['camera_id']} "
+                    f"location={data_object['camera_location']} "
+                    f"frame={data_object['frame_id']} "
+                    f"is_new={data_object['is_new_person']}"
+                    )
+                    
+                    
 
                 print(
                     f"DEBUG vector type={type(embedding_vector)}, "

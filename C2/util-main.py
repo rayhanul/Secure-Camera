@@ -155,7 +155,7 @@ class TransReIDProcessor:
 
     def __init__(
         self,
-        model_path="/home/jdg24001/Documents/github/Secure-Camera/weights-models/transformer_best.pth",
+        model_path="/home/jdg24001/Documents/github/Secure-Camera/weights-models/jx_vit_base_p16_224-80ecf9dd.pth",
         config_path="/home/jdg24001/Documents/github/Secure-Camera/weights-models/vit_transreid_stride.yml",
     ):
         
@@ -177,7 +177,7 @@ class TransReIDProcessor:
 
         
         if model_path is None:
-            model_path = "/home/jdg24001/Documents/github/Secure-Camera/weights-models/transformer_best.pth"
+            model_path = "/home/jdg24001/Documents/github/Secure-Camera/weights-models/jx_vit_base_p16_224-80ecf9dd.pth"
 
         try:
             print("Loading TransReID model...")
@@ -193,7 +193,7 @@ class TransReIDProcessor:
             cfg.MODEL.JPM = True
             cfg.MODEL.PRETRAIN_CHOICE = "self"
             cfg.MODEL.PRETRAIN_PATH = (
-                "/home/jdg24001/Documents/github/Secure-Camera/weights-models/transformer_best.pth"
+                "/home/jdg24001/Documents/github/Secure-Camera/weights-models/jx_vit_base_p16_224-80ecf9dd.pth"
             )
             cfg.TEST.WEIGHT = model_path
             cfg.INPUT.SIZE_TEST = [256, 128]
@@ -390,6 +390,7 @@ class WeaviateReIDManager:
         4. Update person profiles
         """
         results = []
+        print(f"\nTotal number of received objects: {len(objects_data["objects"])}\n")
 
         for i, obj in enumerate(objects_data["objects"]):
             person_feature = reid_features[i : i + 1]  # Shape: [1, feature_dim]
@@ -404,6 +405,14 @@ class WeaviateReIDManager:
             # 2. Determine person identity
             person_identity = self.determine_identity(
                 similar_persons, person_feature, obj
+            )
+
+            print(
+                f"[IDENTITY] object_id={obj.get('object_id', i)} "
+                f"person_id={person_identity['person_id']} "
+                f"is_new={person_identity['is_new']} "
+                f"confidence={person_identity['confidence']:.3f} "
+                f"similar_matches={len(similar_persons)}"
             )
 
             # 3. Store/Update in Weaviate
@@ -461,7 +470,7 @@ class WeaviateReIDManager:
                     result["is_cross_camera"] = result["camera_id"] != current_camera
                     filtered_results.append(result)
 
-            print("done with find_similar_persons")
+            print(f"done with find_similar_persons, and found: {len(filtered_results)}")
             return filtered_results
 
         except Exception as e:
@@ -495,34 +504,34 @@ class WeaviateReIDManager:
                 and p.get("similarity_score", 0) >= self.similarity_threshold
             ]
 
-            # return {
-            #     "person_id": best_match.get(
-            #         "person_id", f"unknown_{best_match.get('object_id')}"
-            #     ),
-            #     "confidence": best_match["similarity_score"],
-            #     "is_new": False,
-            #     "matched_detection": best_match,
-            #     "cross_camera_matches": cross_camera_matches[
-            #         :5
-            #     ],  # Top 5 cross-camera matches
-            # }
-
-            object_id = best_match.get("person_id")
-
-            if object_id is None or object_id == "":
-                self.person_id_counter += 1
-                matched_person_id = f"person_{self.person_id_counter:06d}"
-            else:
-                matched_person_id = f"unknown_{object_id}"
-                
-
             return {
-                "person_id": matched_person_id,
+                "person_id": best_match.get(
+                    "person_id", f"unknown_{best_match.get('object_id')}"
+                ),
                 "confidence": best_match["similarity_score"],
                 "is_new": False,
                 "matched_detection": best_match,
-                "cross_camera_matches": cross_camera_matches[:5],
+                "cross_camera_matches": cross_camera_matches[
+                    :5
+                ],  # Top 5 cross-camera matches
             }
+
+            # object_id = best_match.get("person_id")
+
+            # if object_id is None or object_id == "":
+            #     self.person_id_counter += 1
+            #     matched_person_id = f"person_{self.person_id_counter:06d}"
+            # else:
+            #     matched_person_id = f"unknown_{object_id}"
+                
+
+            # return {
+            #     "person_id": matched_person_id,
+            #     "confidence": best_match["similarity_score"],
+            #     "is_new": False,
+            #     "matched_detection": best_match,
+            #     "cross_camera_matches": cross_camera_matches[:5],
+            # }
 
 
         else:
@@ -767,6 +776,59 @@ class C2Processor:
 
         print("TSN receiver with Weaviate ReID initialized")
 
+
+        # Runtime statistics... ... ... 
+
+        self.start_time = time.time()
+        self.frames_processed = 0
+        self.persons_detected = 0
+        self.new_persons = 0
+        self.existing_persons = 0
+        self.stats_interval = 15
+
+
+    def print_statistics(self):
+        runtime = time.time() - self.start_time
+
+        if runtime > 0:
+            fps = self.frames_processed / runtime
+        else:
+            fps = 0.0
+
+        print("\n" + "-" * 80)
+        print(f"STATISTICS (Runtime: {runtime:.1f}s):")
+        print(f"  Frames processed: {self.frames_processed} ({fps:.2f} FPS)")
+        print(f"  Persons detected: {self.persons_detected}")
+        print(f"  New persons: {self.new_persons}")
+        print(f"  Existing persons: {self.existing_persons}")
+        print("-" * 80)
+
+        
+    def update_statistics(self, reid_results: List[Dict]):
+        """
+        Update runtime statistics after processing one detected_objects packet.
+        """
+
+        self.frames_processed += 1
+
+        persons_in_frame = len(reid_results)
+        self.persons_detected += persons_in_frame
+
+        new_in_frame = sum(1 for r in reid_results if r.get("is_new_person", False))
+        existing_in_frame = persons_in_frame - new_in_frame
+
+        self.new_persons += new_in_frame
+        self.existing_persons += existing_in_frame
+
+        if self.frames_processed % self.stats_interval == 0:
+            self.print_statistics()
+
+
+
+
+
+
+
     def crop_b64_to_processed_image(self, crop_b64: str) -> Optional[List]:
         try:
             crop_bytes = base64.b64decode(crop_b64)
@@ -816,17 +878,24 @@ class C2Processor:
             print(
                 f"person_id={item.get('person_id')} "
                 f"camera={item.get('camera_id')} "
+                f"location={item.get('camera_location')} "
                 f"frame={item.get('frame_id')} "
                 f"time={item.get('timestamp')} "
-                f"bbox={item.get('bbox')}"
             )
 
         print("-" * 80)
 
 
     def process_detection(self, data: Dict) -> List[Dict]:
-        # You get the data from the Redis queue
-        """Complete detection processing pipeline"""
+
+        
+        """
+        
+        
+        Complete detection processing pipeline
+        
+        
+        """
         try:
             data = self.normalize_incoming_data(data)
 
@@ -845,6 +914,8 @@ class C2Processor:
 
             data["objects"] = valid_objects
             
+            print(f"the number of valid objects: {len(valid_objects)}")
+
             # processed_images_count = 0
             # for i, obj in enumerate(data.get("objects", [])):
             #     if "processed_image" in obj:
@@ -887,14 +958,14 @@ class C2Processor:
                 print(f"Flattening invalid ReID feature shape: {reid_features.shape}")
                 reid_features = reid_features.flatten(start_dim=1)
 
-            if reid_features.shape[1] > 384:
-                print(f"Truncating ReID feature from {reid_features.shape[1]} to 384")
-                reid_features = reid_features[:, :384]
+            # if reid_features.shape[1] > 384:
+            #     print(f"Truncating ReID feature from {reid_features.shape[1]} to 384")
+            #     reid_features = reid_features[:, :384]
 
-            elif reid_features.shape[1] < 384:
-                print(f"Padding ReID feature from {reid_features.shape[1]} to 384")
-                pad_size = 384 - reid_features.shape[1]
-                reid_features = torch.nn.functional.pad(reid_features, (0, pad_size))
+            # elif reid_features.shape[1] < 384:
+            #     print(f"Padding ReID feature from {reid_features.shape[1]} to 384")
+            #     pad_size = 384 - reid_features.shape[1]
+            #     reid_features = torch.nn.functional.pad(reid_features, (0, pad_size))
 
             print(f"Fixed ReID features shape: {reid_features.shape}")
 
@@ -1059,6 +1130,10 @@ class C2Processor:
                     
                     
                     results = self.process_detection(data)
+
+                    # Update runtime statistics
+                    self.update_statistics(results)
+
 
                     # Optional: Save results summary
                     if results and self.args.save_results:
@@ -1227,7 +1302,7 @@ def parse_args():
     parser.add_argument(
         "--similarity_threshold",
         type=float,
-        default=0.7,
+        default=0.95,
         help="Similarity threshold for person matching",
     )
     

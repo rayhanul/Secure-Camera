@@ -470,6 +470,56 @@ class C2Processor:
 
         print("TSN receiver with Weaviate ReID initialized")
 
+        # Runtime statistics... ... ... 
+
+        self.start_time = time.time()
+        self.frames_processed = 0
+        self.persons_detected = 0
+        self.new_persons = 0
+        self.existing_persons = 0
+        self.stats_interval = 15
+
+
+    def update_statistics(self, reid_results: List[Dict]):
+        """
+        Update runtime statistics after processing one detected_objects packet.
+        """
+
+        self.frames_processed += 1
+
+        persons_in_frame = len(reid_results)
+        self.persons_detected += persons_in_frame
+
+        new_in_frame = sum(1 for r in reid_results if r.get("is_new_person", False))
+        existing_in_frame = persons_in_frame - new_in_frame
+
+        self.new_persons += new_in_frame
+        self.existing_persons += existing_in_frame
+
+        if self.frames_processed % self.stats_interval == 0:
+            self.print_statistics()
+
+
+    def print_statistics(self):
+        runtime = time.time() - self.start_time
+
+        if runtime > 0:
+            fps = self.frames_processed / runtime
+        else:
+            fps = 0.0
+
+        print("\n" + "-" * 80)
+        print(f"STATISTICS (Runtime: {runtime:.1f}s):")
+        print(f"  Frames processed: {self.frames_processed} ({fps:.2f} FPS)")
+        print(f"  Persons detected: {self.persons_detected}")
+        print(f"  New persons: {self.new_persons}")
+        print(f"  Existing persons: {self.existing_persons}")
+        print("-" * 80)
+
+
+
+
+
     def crop_b64_to_processed_image(self, crop_b64: str) -> Optional[List]:
         try:
             crop_bytes = base64.b64decode(crop_b64)
@@ -678,6 +728,9 @@ class C2Processor:
                     self.log_rx(data, status="object_packet_received")
 
                     results = self.process_detection(data)
+
+                    # Update runtime statistics
+                    self.update_statistics(results)
 
                     if results and self.args.save_results and self.args.save_json:
                         self.save_results_summary(results)

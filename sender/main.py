@@ -321,6 +321,23 @@ def main():
                 camera_location=args.camera_location,
                 save_images=args.save_images,
             )
+            
+            print(
+                f"[CAM2 DETECTION DEBUG] frame_id={frame_id} "
+                f"payload_objects={len(payload.get('objects', []))}"
+            )
+
+            for i, obj in enumerate(payload.get("objects", [])):
+                print(
+                    f"  object {i}: "
+                    f"class={obj.get('class_name')} "
+                    f"conf={obj.get('confidence')} "
+                    f"bbox={obj.get('bbox')} "
+                    f"has_crop={'crop_jpg_b64' in obj} "
+                    f"has_processed={'processed_image' in obj}"
+                )
+    
+    
 
             annotated = draw_boxes(frame, results)
 

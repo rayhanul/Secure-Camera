@@ -303,6 +303,17 @@ python main.py   --camera_index 0   --model_path /home/ubuntu/Documents/secure-c
 
 
 
+
+```
+python3 main.py   --input_type camera   --camera_index 2   --camera_id cam2   --camera_location desk2   --conf_threshold 0.15   --save_annotated_every 1
+
+
+```
+
+
+
+
+
 ```
 
 python main.py --input_type video --video_path sample.mp4 

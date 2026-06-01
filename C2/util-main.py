@@ -864,14 +864,30 @@ class C2Processor:
         data["objects"] = normalized_objects
         return data
     
-    def print_person_history(self, person_id: str):
-        history = self.weaviate_manager.get_person_history(person_id, limit=10)
+    def print_person_history(self, person_id: str, limit: int = 50):
+        history = self.weaviate_manager.get_person_history(person_id, limit=limit)
 
         if not history:
             print(f"No history found for {person_id}")
             return
+        
+        history = sorted(
+            history,
+            key=lambda x: str(x.get("timestamp", "")),
+            reverse=True,
+        )
+
+
+        from collections import Counter
+        camera_counts = Counter(item.get("camera_id") for item in history)
 
         print(f"\nHistory for {person_id}:")
+        print("-" * 80)
+
+        print("Camera summary:")
+        for cam, count in camera_counts.items():
+            print(f"  {cam}: {count} records")
+
         print("-" * 80)
 
         for item in history:
@@ -1302,7 +1318,7 @@ def parse_args():
     parser.add_argument(
         "--similarity_threshold",
         type=float,
-        default=0.95,
+        default=0.98,
         help="Similarity threshold for person matching",
     )
     

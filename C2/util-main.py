@@ -22,11 +22,10 @@ from utils.storage import SecureReIDStorage
 from utils.util import objects_to_tensor
 from utils.weaviate import ReIDVectorStore
 
-# ================= PREDICTION MODIFICATION 1 =================
-# Keep object-history storage, model feeding, and prediction logic in a
-# separate module placed in the same directory as this main file.
-from object_prediction import ExistingObjectPredictor
-# =============== END PREDICTION MODIFICATION 1 ===============
+# ================= PREDICTION =================
+
+from prediction_module.object_prediction import ExistingObjectPredictor
+
 
 
 import struct

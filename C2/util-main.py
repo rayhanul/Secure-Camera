@@ -1456,89 +1456,32 @@ class C2Processor:
         metadata = data.get("metadata", {})
         objects = data.get("objects") or []
 
-        frame_id = metadata.get("frame_id", "unknown")
-        camera_id = metadata.get("camera_id", "unknown")
-        camera_location = metadata.get("camera_location", "unknown")
-
-        print("\n" + "=" * 100)
         print(
-            f"[ACTUAL OBJECTS RECEIVED] "
-            f"frame_id={frame_id} "
-            f"camera={camera_id} "
-            f"location={camera_location} "
-            f"objects={len(objects)}"
+            f"\n[ACTUAL OBJECTS] "
+            f"frame_id={metadata.get('frame_id', 'unknown')} "
+            f"camera={metadata.get('camera_id', 'unknown')} "
+            f"location={metadata.get('camera_location', 'unknown')} "
+            f"count={len(objects)}"
         )
 
-        if not objects:
-            print("  No actual object data was received in this packet.")
-            print("=" * 100)
-            return
-
         for index, obj in enumerate(objects):
+            print(
+                f"  actual object {index}: "
+                f"class={obj.get('class_name') or obj.get('class', 'unknown')} "
+                f"conf={obj.get('confidence', obj.get('conf'))} "
+                f"track_id={obj.get('track_id', obj.get('object_track_id', obj.get('object_id')))} "
+                f"bbox={obj.get('bbox')} "
+                f"distance_m={obj.get('distance_m', obj.get('distance'))} "
+                f"bearing_deg={obj.get('bearing_deg', obj.get('bearing_angle'))} "
+                f"direction={obj.get('direction') or obj.get('motion_direction')} "
+                f"speed_kmh={obj.get('speed_kmh', obj.get('speed'))} "
+                f"has_crop={obj.get('has_crop')} "
+                f"has_processed={obj.get('has_processed')}"
+            )
 
-            class_name = obj.get("class_name")
-            if class_name is None:
-                class_name = obj.get("class", "unknown")
 
-            confidence = obj.get("confidence")
-            if confidence is None:
-                confidence = obj.get("conf")
 
-            track_id = obj.get("track_id")
-            if track_id is None:
-                track_id = obj.get("object_track_id", obj.get("object_id"))
-
-            bbox = obj.get("bbox")
-
-            distance_m = obj.get("distance_m")
-            if distance_m is None:
-                distance_m = obj.get("distance")
-
-            bearing_deg = obj.get("bearing_deg")
-            if bearing_deg is None:
-                bearing_deg = obj.get("bearing_angle")
-
-            direction = obj.get("direction")
-            if direction is None:
-                direction = obj.get("motion_direction")
-
-            speed_kmh = obj.get("speed_kmh")
-            if speed_kmh is None:
-                speed_kmh = obj.get("speed")
-
-            print(f"\n  Actual object {index}:")
-            print(f"    class       = {class_name}")
-            print(f"    confidence  = {confidence}")
-            print(f"    track_id    = {track_id}")
-            print(f"    bbox        = {bbox}")
-            print(f"    distance_m  = {distance_m}")
-            print(f"    bearing_deg = {bearing_deg}")
-            print(f"    direction   = {direction}")
-            print(f"    speed_kmh   = {speed_kmh}")
-            print(f"    has_crop    = {obj.get('has_crop')}")
-            print(f"    processed   = {obj.get('has_processed')}")
-
-            missing_fields = []
-
-            for field_name, value in (
-                ("class", class_name),
-                ("confidence", confidence),
-                ("track_id", track_id),
-                ("bbox", bbox),
-                ("distance_m", distance_m),
-                ("bearing_deg", bearing_deg),
-                ("direction", direction),
-                ("speed_kmh", speed_kmh),
-            ):
-                if value is None or value == "":
-                    missing_fields.append(field_name)
-
-            if missing_fields:
-                print(f"    missing     = {missing_fields}")
-            else:
-                print("    missing     = none")
-
-        print("=" * 100)
+        
         
             
 

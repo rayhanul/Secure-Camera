@@ -22,6 +22,12 @@ from utils.storage import SecureReIDStorage
 from utils.util import objects_to_tensor
 from utils.weaviate import ReIDVectorStore
 
+# ================= PREDICTION MODIFICATION 1 =================
+# Keep object-history storage, model feeding, and prediction logic in a
+# separate module placed in the same directory as this main file.
+from object_prediction import ExistingObjectPredictor
+# =============== END PREDICTION MODIFICATION 1 ===============
+
 
 import struct
 
@@ -752,6 +758,39 @@ class C2Processor:
 
         # Initialize components
         self.receiver = TSNReceiver(args.listen_ip, args.port)
+
+        # ================= PREDICTION MODIFICATION 2 =================
+        # Create one predictor for all cameras. It internally separates history
+        # by (camera_id, camera_location, track_id). A trained GRU checkpoint is
+        # optional; without it, robust history extrapolation is used.
+        self.object_predictor = None
+        if not args.disable_object_prediction:
+            self.object_predictor = ExistingObjectPredictor(
+                fps=args.camera_fps,
+                history_size=args.prediction_history,
+                max_missed_frames=args.prediction_max_missed,
+                max_radial_speed_kmh=args.prediction_max_speed_kmh,
+                frame_width=args.prediction_frame_width,
+                frame_height=args.prediction_frame_height,
+                model_path=args.prediction_model_path,
+                model_device=args.prediction_device,
+                model_hidden_size=args.prediction_hidden_size,
+                model_num_layers=args.prediction_num_layers,
+                max_distance_m=args.prediction_max_distance_m,
+                max_bearing_deg=args.prediction_max_bearing_deg,
+            )
+            prediction_method = (
+                "trained GRU"
+                if self.object_predictor.model_enabled
+                else "robust history fallback"
+            )
+            print(
+                "Existing-object prediction enabled: "
+                f"method={prediction_method}, "
+                f"history={args.prediction_history}, "
+                f"max_missed={args.prediction_max_missed}"
+            )
+        # =============== END PREDICTION MODIFICATION 2 ===============
         
         self.transreid_processor = TransReIDProcessor(model_path=args.transreid_model_path)
         self.weaviate_manager = WeaviateReIDManager(
@@ -785,6 +824,98 @@ class C2Processor:
         self.new_persons = 0
         self.existing_persons = 0
         self.stats_interval = 15
+
+    # ================= PREDICTION MODIFICATION 3 =================
+    def process_object_predictions(self, data: Dict) -> List[Dict]:
+        """Store actual observations and predict missing existing objects.
+
+        Predictions are attached to ``predicted_existing_objects`` instead of
+        ``objects`` because they have no real crop or ReID embedding and must
+        not be stored as actual observations.
+        """
+        if self.object_predictor is None:
+            return []
+
+        predictions = self.object_predictor.process_packet(data)
+        data["predicted_existing_objects"] = predictions
+
+        if not predictions:
+            if self.object_predictor.prediction_requested(data):
+                print(
+                    "[PREDICTION] Prediction was requested, but no eligible "
+                    "existing tracks were found in server history"
+                )
+            return []
+
+        metadata = data.get("metadata", {})
+        frame_id = metadata.get(
+            "prediction_target_frame_id",
+            metadata.get("frame_id", "unknown"),
+        )
+        camera_id = metadata.get("camera_id", "unknown")
+        camera_location = metadata.get("camera_location", "unknown")
+
+        print("\n" + "=" * 80)
+        print(
+            f"[SERVER PREDICTION] frame_id={frame_id} "
+            f"camera={camera_id} location={camera_location} "
+            f"predicted_existing_objects={len(predictions)}"
+        )
+        for index, obj in enumerate(predictions):
+            print(
+                f"  predicted object {index}: "
+                f"class={obj.get('class_name')} "
+                f"track_id={obj.get('track_id')} "
+                f"bbox={obj.get('bbox')} "
+                f"distance_m={obj.get('distance_m')} "
+                f"bearing_deg={obj.get('bearing_deg')} "
+                f"direction={obj.get('direction')} "
+                f"speed_kmh={obj.get('speed_kmh')} "
+                f"predicted_fields={obj.get('predicted_fields')} "
+                f"source={obj.get('prediction_source')} "
+                f"confidence={obj.get('prediction_confidence')}"
+            )
+        print("=" * 80)
+
+        if self.args.save_predictions:
+            self.save_predicted_objects(data, predictions)
+        return predictions
+
+    def save_predicted_objects(self, data: Dict, predictions: List[Dict]):
+        metadata = data.get("metadata", {})
+        camera_id = str(metadata.get("camera_id", "unknown"))
+        camera_location = str(metadata.get("camera_location", "unknown"))
+        frame_id = metadata.get(
+            "prediction_target_frame_id",
+            metadata.get("frame_id", "unknown"),
+        )
+        safe_camera = "".join(
+            character if character.isalnum() or character in "-_" else "_"
+            for character in f"{camera_location}_{camera_id}"
+        )
+        os.makedirs(self.args.prediction_output_dir, exist_ok=True)
+        filename = os.path.join(
+            self.args.prediction_output_dir,
+            f"{safe_camera}_frame_{frame_id}_predicted.json",
+        )
+        output = {
+            "type": "predicted_existing_objects",
+            "metadata": {
+                "camera_id": camera_id,
+                "camera_location": camera_location,
+                "frame_id": frame_id,
+                "generated_at": datetime.now().isoformat(),
+                "actual_payload_pending": True,
+            },
+            "objects": predictions,
+        }
+        try:
+            with open(filename, "w") as prediction_file:
+                json.dump(output, prediction_file, indent=2, default=str)
+            print(f"[PREDICTION SAVED] {filename}")
+        except Exception as e:
+            print(f"Could not save object predictions: {e}")
+    # =============== END PREDICTION MODIFICATION 3 ===============
 
 
     def print_statistics(self):
@@ -1137,12 +1268,23 @@ class C2Processor:
                     continue
 
                 if payload_type == "detected_objects":
+                    # ================= PREDICTION MODIFICATION 4 =================
+                    # Run before process_detection(), which filters the packet
+                    # down to person objects that contain real image crops.
+                    predictions = self.process_object_predictions(data)
+                    # =============== END PREDICTION MODIFICATION 4 ===============
+
                     if not data.get("objects"):
-                        
-                        self.log_rx(data, status="empty_object_packet")
+                        status = "empty_object_packet"
+                        if predictions:
+                            status += f" predicted_existing={len(predictions)}"
+                        self.log_rx(data, status=status)
                         continue
 
-                    self.log_rx(data, status="object_packet_received")
+                    status = "object_packet_received"
+                    if predictions:
+                        status += f" predicted_existing={len(predictions)}"
+                    self.log_rx(data, status=status)
                     
                     
                     results = self.process_detection(data)
@@ -1336,6 +1478,80 @@ def parse_args():
     parser.add_argument(
         "--verbose", action="store_true", help="Enable verbose debug output"
     )
+
+    # ================= PREDICTION MODIFICATION 5 =================
+    # Runtime and optional trained-model configuration.
+    parser.add_argument(
+        "--disable_object_prediction",
+        action="store_true",
+        help="Disable server-side prediction of omitted existing objects",
+    )
+    parser.add_argument(
+        "--camera_fps",
+        type=float,
+        default=25.0,
+        help="Source FPS used when capture timestamps are unavailable",
+    )
+    parser.add_argument(
+        "--prediction_history",
+        type=int,
+        default=10,
+        help="Number of actual observations retained and fed to the model",
+    )
+    parser.add_argument(
+        "--prediction_max_missed",
+        type=int,
+        default=3,
+        help="Maximum number of consecutive frames predicted per track",
+    )
+    parser.add_argument(
+        "--prediction_max_speed_kmh",
+        type=float,
+        default=180.0,
+        help="Maximum plausible radial speed used to limit distance outliers",
+    )
+    parser.add_argument(
+        "--prediction_frame_width", type=int, default=1920
+    )
+    parser.add_argument(
+        "--prediction_frame_height", type=int, default=1080
+    )
+    parser.add_argument(
+        "--prediction_max_distance_m", type=float, default=500.0
+    )
+    parser.add_argument(
+        "--prediction_max_bearing_deg", type=float, default=45.0
+    )
+    parser.add_argument(
+        "--prediction_model_path",
+        type=str,
+        default=None,
+        help="Optional trained ObjectMotionGRU checkpoint",
+    )
+    parser.add_argument(
+        "--prediction_device",
+        type=str,
+        default="auto",
+        help="Prediction model device: auto, cpu, cuda, or cuda:N",
+    )
+    parser.add_argument(
+        "--prediction_hidden_size", type=int, default=128
+    )
+    parser.add_argument(
+        "--prediction_num_layers", type=int, default=2
+    )
+    parser.add_argument(
+        "--save_predictions",
+        action="store_true",
+        help="Save predicted existing objects as JSON files",
+    )
+    parser.add_argument(
+        "--prediction_output_dir",
+        type=str,
+        default="predicted_objects",
+        help="Output directory used with --save_predictions",
+    )
+    # =============== END PREDICTION MODIFICATION 5 ===============
 
     return parser.parse_args()
 

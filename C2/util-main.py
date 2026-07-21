@@ -6,7 +6,6 @@ import socket
 import zlib
 import base64
 import time
-from collections import Counter, deque
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -22,6 +21,12 @@ from utils.storage import SecureReIDStorage
 # TransReID imports will be handled within the TransReIDProcessor class
 from utils.util import objects_to_tensor
 from utils.weaviate import ReIDVectorStore
+
+# ================= PREDICTION MODIFICATION 1 =================
+# Keep object-history storage, model feeding, and prediction logic in a
+# separate module placed in the same directory as this main file.
+from object_prediction import ExistingObjectPredictor
+# =============== END PREDICTION MODIFICATION 1 ===============
 
 
 import struct
@@ -64,775 +69,6 @@ def parse_timestamp(timestamp_value):
                 return time.time()
 
     return time.time()
-
-
-class ExistingObjectPredictor:
-    """
-    Predict properties of known tracks when the sender transmits only newly
-    detected objects during a GCL update.
-
-    The sender must explicitly mark a reduced packet. Supported markers are:
-
-        metadata["existing_objects_omitted"] = True
-        metadata["prediction_required"] = True
-        metadata["transmission_mode"] = "new_objects_only"
-        metadata["object_data_empty"] = True
-        metadata["existing_track_ids"] = [4, 28, 32]
-
-    If possible, the sender should also include ``omitted_track_ids``. Without
-    that list, every recently observed track that is missing from the packet is
-    treated as an omitted existing object for a small number of frames.
-
-    A received known track can also contain partial/empty properties. In that
-    case the predictor keeps every valid transmitted value and fills only the
-    missing bbox, distance, bearing, direction, and speed fields from history.
-
-    Only actual observations are added to history. Predicted observations are
-    never fed back into the predictor, which prevents prediction drift.
-    """
-
-    REDUCED_TRANSMISSION_MODES = {
-        "new_objects_only",
-        "reduced_existing_objects",
-        "prediction_only",
-        "gcl_reconfiguration",
-        "empty_existing_data",
-        "minimal_existing_data",
-        "metadata_only",
-    }
-
-    def __init__(
-        self,
-        fps=25.0,
-        history_size=10,
-        max_missed_frames=3,
-        max_radial_speed_kmh=180.0,
-        frame_width=1920,
-        frame_height=1080,
-    ):
-        self.fps = max(float(fps), 0.001)
-        self.history_size = max(int(history_size), 2)
-        self.max_missed_frames = max(int(max_missed_frames), 1)
-        self.max_radial_speed_kmh = max(float(max_radial_speed_kmh), 1.0)
-        self.default_frame_width = max(int(frame_width), 1)
-        self.default_frame_height = max(int(frame_height), 1)
-
-        # Key: ((camera_id, camera_location), string_track_id)
-        self.track_histories = {}
-        self.latest_frame_by_camera = {}
-
-    @staticmethod
-    def _first_value(mapping, *names, default=None):
-        for name in names:
-            value = mapping.get(name)
-            if value is not None:
-                return value
-        return default
-
-    @staticmethod
-    def _as_int(value, default=None):
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return default
-
-    @staticmethod
-    def _as_float(value, default=None):
-        try:
-            result = float(value)
-            if np.isfinite(result):
-                return result
-        except (TypeError, ValueError):
-            pass
-        return default
-
-    @staticmethod
-    def _camera_key(metadata):
-        camera_id = metadata.get("camera_id", "unknown")
-        camera_location = metadata.get("camera_location", "unknown")
-        return str(camera_id), str(camera_location)
-
-    @staticmethod
-    def _track_key(track_id):
-        return str(track_id)
-
-    @staticmethod
-    def _has_text(value):
-        if value is None:
-            return False
-        text = str(value).strip().lower()
-        return text not in {"", "none", "null", "nan", "unknown"}
-
-    def _valid_bbox(self, obj):
-        bbox = obj.get("bbox")
-        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
-            return None
-
-        coords = [self._as_float(value) for value in bbox]
-        if any(value is None for value in coords):
-            return None
-
-        x1, y1, x2, y2 = coords
-        if x2 <= x1 or y2 <= y1:
-            return None
-        return coords
-
-    def _missing_prediction_fields(self, obj):
-        """Return motion/property fields that are empty in a descriptor."""
-        missing = []
-        if self._valid_bbox(obj) is None:
-            missing.append("bbox")
-        if self._as_float(
-            self._first_value(obj, "distance_m", "distance")
-        ) is None:
-            missing.append("distance_m")
-        if self._as_float(
-            self._first_value(obj, "bearing_deg", "bearing_angle")
-        ) is None:
-            missing.append("bearing_deg")
-        if not self._has_text(
-            self._first_value(obj, "direction", "motion_direction")
-        ):
-            missing.append("direction")
-        if self._as_float(
-            self._first_value(obj, "speed_kmh", "speed")
-        ) is None:
-            missing.append("speed_kmh")
-        return missing
-
-    def _frame_id(self, metadata, camera_key):
-        frame_id = self._as_int(metadata.get("frame_id"))
-        if frame_id is not None:
-            return frame_id
-        return self.latest_frame_by_camera.get(camera_key, -1) + 1
-
-    def _frame_timestamp(self, metadata, frame_id):
-        timestamp_value = self._first_value(
-            metadata,
-            "capture_timestamp",
-            "timestamp",
-            "timestamp_s",
-        )
-        if timestamp_value is None:
-            # Video/source time is more stable than packet-arrival time.
-            return float(frame_id) / self.fps
-        return parse_timestamp(timestamp_value)
-
-    def prediction_requested(self, data):
-        metadata = data.get("metadata", {})
-        mode = str(
-            self._first_value(
-                metadata,
-                "transmission_mode",
-                default=data.get("transmission_mode", ""),
-            )
-        ).lower()
-
-        return bool(
-            metadata.get("existing_objects_omitted")
-            or metadata.get("prediction_required")
-            or metadata.get("object_data_empty")
-            or metadata.get("existing_object_data_empty")
-            or data.get("existing_objects_omitted")
-            or data.get("prediction_required")
-            or data.get("object_data_empty")
-            or data.get("existing_object_data_empty")
-            or metadata.get("existing_track_ids")
-            or data.get("existing_track_ids")
-            or mode in self.REDUCED_TRANSMISSION_MODES
-        )
-
-    def _normalize_observation(
-        self,
-        obj,
-        frame_id,
-        timestamp,
-    ):
-        track_id = self._first_value(obj, "track_id", "object_track_id")
-        if track_id is None:
-            # object_id is safe only when the sender makes it persistent.
-            track_id = obj.get("object_id")
-        if track_id is None:
-            return None
-
-        coords = self._valid_bbox(obj)
-        if coords is None:
-            return None
-        x1, y1, x2, y2 = coords
-
-        distance = self._as_float(
-            self._first_value(obj, "distance_m", "distance")
-        )
-        bearing = self._as_float(
-            self._first_value(obj, "bearing_deg", "bearing_angle")
-        )
-
-        observation = {
-            "frame_id": frame_id,
-            "timestamp": timestamp,
-            "track_id": track_id,
-            "class_name": self._first_value(
-                obj,
-                "class_name",
-                "class",
-                default="unknown",
-            ),
-            "class_id": obj.get("class_id"),
-            "confidence": self._as_float(obj.get("confidence"), 0.0),
-            "cx": (x1 + x2) / 2.0,
-            "cy": (y1 + y2) / 2.0,
-            "width": x2 - x1,
-            "height": y2 - y1,
-            "distance_m": distance,
-            "bearing_deg": bearing,
-            "speed_kmh": self._as_float(
-                self._first_value(obj, "speed_kmh", "speed")
-            ),
-            "direction": self._first_value(
-                obj,
-                "direction",
-                "motion_direction",
-                default="unknown",
-            ),
-            "jpeg_crop_size": self._as_float(obj.get("jpeg_crop_size")),
-            "serialized_object_size": self._as_float(
-                obj.get("serialized_object_size")
-            ),
-            "privacy_level": obj.get("privacy_level"),
-            "global_person_id": self._first_value(
-                obj,
-                "global_person_id",
-                "person_id",
-            ),
-        }
-        return observation
-
-    def _observe_actual_objects(
-        self,
-        camera_key,
-        frame_id,
-        timestamp,
-        objects,
-    ):
-        for obj in objects:
-            observation = self._normalize_observation(
-                obj,
-                frame_id,
-                timestamp,
-            )
-            if observation is None:
-                continue
-
-            key = (camera_key, self._track_key(observation["track_id"]))
-            history = self.track_histories.get(key)
-            if history is None:
-                history = deque(maxlen=self.history_size)
-                self.track_histories[key] = history
-
-            if history and frame_id <= history[-1]["frame_id"]:
-                continue
-
-            history.append(observation)
-
-    def _robust_extrapolate(
-        self,
-        history,
-        field,
-        target_timestamp,
-        maximum_absolute_rate=None,
-    ):
-        points = []
-        for observation in history:
-            value = self._as_float(observation.get(field))
-            timestamp = self._as_float(observation.get("timestamp"))
-            if value is not None and timestamp is not None:
-                points.append((timestamp, value))
-
-        if not points:
-            return None, 0.0, 0.0
-        if len(points) == 1:
-            return points[-1][1], 0.0, 0.0
-
-        slopes = []
-        for first_index in range(len(points)):
-            for second_index in range(first_index + 1, len(points)):
-                delta_time = (
-                    points[second_index][0] - points[first_index][0]
-                )
-                if delta_time > 0:
-                    slopes.append(
-                        (
-                            points[second_index][1]
-                            - points[first_index][1]
-                        )
-                        / delta_time
-                    )
-
-        if not slopes:
-            return points[-1][1], 0.0, 0.0
-
-        raw_rate = float(np.median(slopes))
-        used_rate = raw_rate
-        if maximum_absolute_rate is not None:
-            used_rate = float(
-                np.clip(
-                    used_rate,
-                    -maximum_absolute_rate,
-                    maximum_absolute_rate,
-                )
-            )
-
-        last_timestamp, last_value = points[-1]
-        prediction_horizon = max(0.0, target_timestamp - last_timestamp)
-        prediction = last_value + used_rate * prediction_horizon
-        return prediction, used_rate, raw_rate
-
-    def _predict_track(
-        self,
-        history,
-        target_frame_id,
-        target_timestamp,
-        frame_width,
-        frame_height,
-    ):
-        last = history[-1]
-        frames_since_observation = target_frame_id - last["frame_id"]
-        if frames_since_observation <= 0:
-            return None
-        if frames_since_observation > self.max_missed_frames:
-            return None
-
-        cx, _, _ = self._robust_extrapolate(
-            history, "cx", target_timestamp
-        )
-        cy, _, _ = self._robust_extrapolate(
-            history, "cy", target_timestamp
-        )
-        width, _, _ = self._robust_extrapolate(
-            history, "width", target_timestamp
-        )
-        height, _, _ = self._robust_extrapolate(
-            history, "height", target_timestamp
-        )
-
-        if None in (cx, cy, width, height):
-            return None
-
-        width = max(2.0, width)
-        height = max(2.0, height)
-
-        x1 = int(round(cx - width / 2.0))
-        y1 = int(round(cy - height / 2.0))
-        x2 = int(round(cx + width / 2.0))
-        y2 = int(round(cy + height / 2.0))
-
-        x1 = int(np.clip(x1, 0, frame_width - 1))
-        y1 = int(np.clip(y1, 0, frame_height - 1))
-        x2 = int(np.clip(x2, 0, frame_width - 1))
-        y2 = int(np.clip(y2, 0, frame_height - 1))
-        if x2 <= x1 or y2 <= y1:
-            return None
-
-        maximum_distance_rate = self.max_radial_speed_kmh / 3.6
-        distance, distance_rate, raw_distance_rate = self._robust_extrapolate(
-            history,
-            "distance_m",
-            target_timestamp,
-            maximum_absolute_rate=maximum_distance_rate,
-        )
-        bearing, _, _ = self._robust_extrapolate(
-            history,
-            "bearing_deg",
-            target_timestamp,
-            maximum_absolute_rate=120.0,
-        )
-
-        predicted_crop_size, _, _ = self._robust_extrapolate(
-            history,
-            "jpeg_crop_size",
-            target_timestamp,
-        )
-        predicted_serialized_size, _, _ = self._robust_extrapolate(
-            history,
-            "serialized_object_size",
-            target_timestamp,
-        )
-
-        recent_classes = [
-            str(item.get("class_name", "unknown")) for item in history
-        ]
-        class_name = Counter(recent_classes).most_common(1)[0][0]
-        recent_confidences = [
-            self._as_float(item.get("confidence"), 0.0)
-            for item in list(history)[-3:]
-        ]
-        expected_detector_confidence = float(np.median(recent_confidences))
-
-        history_support = min(1.0, len(history) / 3.0)
-        prediction_confidence = (
-            expected_detector_confidence
-            * history_support
-            * (0.85 ** frames_since_observation)
-        )
-
-        if distance is None:
-            speed_kmh = self._as_float(
-                self._first_value(last, "speed_kmh", "speed"),
-                0.0,
-            )
-            raw_speed_kmh = speed_kmh
-            direction = self._first_value(
-                last,
-                "direction",
-                "motion_direction",
-                default="unknown",
-            )
-        else:
-            speed_kmh = abs(distance_rate) * 3.6
-            raw_speed_kmh = abs(raw_distance_rate) * 3.6
-            if speed_kmh < 2.0:
-                direction = "stationary"
-            elif distance_rate < 0:
-                direction = "approaching"
-            else:
-                direction = "moving_away"
-
-        prediction = {
-            "object_id": f"predicted_{last['track_id']}",
-            "track_id": last["track_id"],
-            "class_name": class_name,
-            "class_id": last.get("class_id"),
-            "confidence": round(expected_detector_confidence, 6),
-            "bbox": [x1, y1, x2, y2],
-            "distance_m": (
-                round(max(0.0, distance), 3)
-                if distance is not None
-                else None
-            ),
-            "bearing_deg": (
-                round(bearing, 2) if bearing is not None else None
-            ),
-            "direction": direction,
-            "speed_kmh": round(speed_kmh, 3),
-            "raw_speed_kmh": round(raw_speed_kmh, 3),
-            "speed_outlier": raw_speed_kmh > self.max_radial_speed_kmh,
-            "prediction_confidence": round(prediction_confidence, 6),
-            "prediction_history_length": len(history),
-            "last_observed_frame_id": last["frame_id"],
-            "predicted_for_frame_id": target_frame_id,
-            "timestamp": target_timestamp,
-            "predicted": True,
-            "prediction_source": "server_track_history",
-            "actual_payload_pending": True,
-            "has_crop": False,
-            "has_processed": False,
-        }
-
-        if predicted_crop_size is not None:
-            prediction["jpeg_crop_size"] = int(
-                round(max(0.0, predicted_crop_size))
-            )
-        if predicted_serialized_size is not None:
-            prediction["serialized_object_size"] = int(
-                round(max(0.0, predicted_serialized_size))
-            )
-        if last.get("privacy_level") is not None:
-            prediction["privacy_level"] = last["privacy_level"]
-        if last.get("global_person_id") is not None:
-            prediction["global_person_id"] = last["global_person_id"]
-
-        return prediction
-
-    def _merge_partial_descriptor(
-        self,
-        prediction,
-        partial_object,
-        missing_fields,
-        history,
-        target_timestamp,
-    ):
-        """
-        Keep valid transmitted values and use the history prediction only for
-        fields that are empty in an existing-object descriptor.
-        """
-        prediction = dict(prediction)
-
-        actual_bbox = self._valid_bbox(partial_object)
-        if actual_bbox is not None:
-            prediction["bbox"] = [int(round(value)) for value in actual_bbox]
-
-        actual_distance = self._as_float(
-            self._first_value(partial_object, "distance_m", "distance")
-        )
-        if actual_distance is not None:
-            prediction["distance_m"] = round(max(0.0, actual_distance), 3)
-
-        actual_bearing = self._as_float(
-            self._first_value(
-                partial_object,
-                "bearing_deg",
-                "bearing_angle",
-            )
-        )
-        if actual_bearing is not None:
-            prediction["bearing_deg"] = round(actual_bearing, 2)
-
-        actual_direction = self._first_value(
-            partial_object,
-            "direction",
-            "motion_direction",
-        )
-        if self._has_text(actual_direction):
-            prediction["direction"] = str(actual_direction)
-
-        actual_speed = self._as_float(
-            self._first_value(partial_object, "speed_kmh", "speed")
-        )
-        if actual_speed is not None:
-            prediction["speed_kmh"] = round(max(0.0, actual_speed), 3)
-            prediction["raw_speed_kmh"] = round(max(0.0, actual_speed), 3)
-            prediction["speed_outlier"] = (
-                actual_speed > self.max_radial_speed_kmh
-            )
-
-        # If current distance is real but speed/direction are empty, include
-        # that distance in a temporary slope calculation. This temporary point
-        # is not stored as a complete observation unless a real bbox exists.
-        if actual_distance is not None and (
-            "speed_kmh" in missing_fields or "direction" in missing_fields
-        ):
-            distance_points = list(history)
-            distance_points.append(
-                {
-                    "timestamp": target_timestamp,
-                    "distance_m": actual_distance,
-                }
-            )
-            _, distance_rate, raw_distance_rate = self._robust_extrapolate(
-                distance_points,
-                "distance_m",
-                target_timestamp,
-                maximum_absolute_rate=self.max_radial_speed_kmh / 3.6,
-            )
-            derived_speed = abs(distance_rate) * 3.6
-            raw_derived_speed = abs(raw_distance_rate) * 3.6
-
-            if "speed_kmh" in missing_fields:
-                prediction["speed_kmh"] = round(derived_speed, 3)
-                prediction["raw_speed_kmh"] = round(
-                    raw_derived_speed,
-                    3,
-                )
-                prediction["speed_outlier"] = (
-                    raw_derived_speed > self.max_radial_speed_kmh
-                )
-
-            if "direction" in missing_fields:
-                if derived_speed < 2.0:
-                    prediction["direction"] = "stationary"
-                elif distance_rate < 0:
-                    prediction["direction"] = "approaching"
-                else:
-                    prediction["direction"] = "moving_away"
-
-        # Preserve identifiers and other non-empty metadata sent by the edge.
-        for field in (
-            "object_id",
-            "track_id",
-            "class_id",
-            "privacy_level",
-            "global_person_id",
-            "person_id",
-            "jpeg_crop_size",
-            "serialized_object_size",
-        ):
-            value = partial_object.get(field)
-            if value is not None and value != "":
-                prediction[field] = value
-
-        class_name = self._first_value(
-            partial_object,
-            "class_name",
-            "class",
-        )
-        if self._has_text(class_name):
-            prediction["class_name"] = class_name
-
-        actual_confidence = self._as_float(partial_object.get("confidence"))
-        if actual_confidence is not None:
-            prediction["confidence"] = round(actual_confidence, 6)
-
-        prediction["partial_descriptor_received"] = True
-        prediction["prediction_reason"] = "partial_existing_object"
-        prediction["predicted_fields"] = list(missing_fields)
-        prediction["actual_fields_received"] = [
-            field
-            for field in (
-                "bbox",
-                "distance_m",
-                "bearing_deg",
-                "direction",
-                "speed_kmh",
-            )
-            if field not in missing_fields
-        ]
-        return prediction
-
-    def process_packet(self, data):
-        """
-        Record actual objects and, for a reduced packet, return predictions for
-        omitted existing objects at the packet's frame/time.
-        """
-        metadata = data.get("metadata", {})
-        camera_key = self._camera_key(metadata)
-        frame_id = self._frame_id(metadata, camera_key)
-        timestamp = self._frame_timestamp(metadata, frame_id)
-        objects = data.get("objects", []) or []
-
-        received_track_ids = set()
-        partial_objects_by_track = {}
-        for obj in objects:
-            track_id = self._first_value(
-                obj,
-                "track_id",
-                "object_track_id",
-                "object_id",
-            )
-            if track_id is not None:
-                track_key = self._track_key(track_id)
-                received_track_ids.add(track_key)
-
-                # Automatically fill empty properties when this track already
-                # exists in server history, even if the sender did not set a
-                # packet-level prediction flag.
-                missing_fields = self._missing_prediction_fields(obj)
-                if (
-                    missing_fields
-                    and (camera_key, track_key) in self.track_histories
-                ):
-                    partial_objects_by_track[track_key] = (
-                        obj,
-                        missing_fields,
-                    )
-
-        omitted_track_ids = self._first_value(
-            metadata,
-            "omitted_track_ids",
-            "existing_track_ids",
-            "tracks_to_predict",
-            default=self._first_value(
-                data,
-                "omitted_track_ids",
-                "existing_track_ids",
-                "tracks_to_predict",
-            ),
-        )
-        omitted_track_keys = None
-        if isinstance(omitted_track_ids, (list, tuple, set)):
-            omitted_track_keys = {
-                self._track_key(track_id) for track_id in omitted_track_ids
-            }
-
-        predictions = []
-        if self.prediction_requested(data) or partial_objects_by_track:
-            target_frame_id = self._as_int(
-                self._first_value(
-                    metadata,
-                    "prediction_target_frame_id",
-                    default=frame_id,
-                ),
-                frame_id,
-            )
-            target_timestamp = timestamp + (
-                max(0, target_frame_id - frame_id) / self.fps
-            )
-
-            frame_width = self._as_int(
-                self._first_value(
-                    metadata,
-                    "frame_width",
-                    "image_width",
-                ),
-                self.default_frame_width,
-            )
-            frame_height = self._as_int(
-                self._first_value(
-                    metadata,
-                    "frame_height",
-                    "image_height",
-                ),
-                self.default_frame_height,
-            )
-
-            for (history_camera, track_key), history in list(
-                self.track_histories.items()
-            ):
-                if history_camera != camera_key or not history:
-                    continue
-                partial_record = partial_objects_by_track.get(track_key)
-                if track_key in received_track_ids and partial_record is None:
-                    continue
-                if (
-                    omitted_track_keys is not None
-                    and track_key not in omitted_track_keys
-                    and partial_record is None
-                ):
-                    continue
-
-                prediction = self._predict_track(
-                    history=history,
-                    target_frame_id=target_frame_id,
-                    target_timestamp=target_timestamp,
-                    frame_width=frame_width,
-                    frame_height=frame_height,
-                )
-                if prediction is not None:
-                    if partial_record is not None:
-                        partial_object, missing_fields = partial_record
-                        prediction = self._merge_partial_descriptor(
-                            prediction=prediction,
-                            partial_object=partial_object,
-                            missing_fields=missing_fields,
-                            history=history,
-                            target_timestamp=target_timestamp,
-                        )
-                    else:
-                        prediction["prediction_reason"] = (
-                            "omitted_existing_object"
-                        )
-                        prediction["predicted_fields"] = [
-                            "bbox",
-                            "distance_m",
-                            "bearing_deg",
-                            "direction",
-                            "speed_kmh",
-                        ]
-                    predictions.append(prediction)
-
-        # Add only actual received objects after prediction. This also lets a
-        # newly received object become an existing track in the next frame.
-        self._observe_actual_objects(
-            camera_key=camera_key,
-            frame_id=frame_id,
-            timestamp=timestamp,
-            objects=objects,
-        )
-        self.latest_frame_by_camera[camera_key] = max(
-            frame_id,
-            self.latest_frame_by_camera.get(camera_key, frame_id),
-        )
-
-        # Remove histories that are far outside the prediction horizon.
-        stale_before = frame_id - max(self.max_missed_frames * 5, 25)
-        for key, history in list(self.track_histories.items()):
-            if (
-                key[0] == camera_key
-                and history
-                and history[-1]["frame_id"] < stale_before
-            ):
-                del self.track_histories[key]
-
-        return predictions
 
 
 
@@ -1523,6 +759,10 @@ class C2Processor:
         # Initialize components
         self.receiver = TSNReceiver(args.listen_ip, args.port)
 
+        # ================= PREDICTION MODIFICATION 2 =================
+        # Create one predictor for all cameras. It internally separates history
+        # by (camera_id, camera_location, track_id). A trained GRU checkpoint is
+        # optional; without it, robust history extrapolation is used.
         self.object_predictor = None
         if not args.disable_object_prediction:
             self.object_predictor = ExistingObjectPredictor(
@@ -1532,13 +772,25 @@ class C2Processor:
                 max_radial_speed_kmh=args.prediction_max_speed_kmh,
                 frame_width=args.prediction_frame_width,
                 frame_height=args.prediction_frame_height,
+                model_path=args.prediction_model_path,
+                model_device=args.prediction_device,
+                model_hidden_size=args.prediction_hidden_size,
+                model_num_layers=args.prediction_num_layers,
+                max_distance_m=args.prediction_max_distance_m,
+                max_bearing_deg=args.prediction_max_bearing_deg,
+            )
+            prediction_method = (
+                "trained GRU"
+                if self.object_predictor.model_enabled
+                else "robust history fallback"
             )
             print(
-                "Existing-object prediction enabled "
-                f"(history={args.prediction_history}, "
-                f"max_missed={args.prediction_max_missed}, "
-                f"max_speed={args.prediction_max_speed_kmh:.1f} km/h)"
+                "Existing-object prediction enabled: "
+                f"method={prediction_method}, "
+                f"history={args.prediction_history}, "
+                f"max_missed={args.prediction_max_missed}"
             )
+        # =============== END PREDICTION MODIFICATION 2 ===============
         
         self.transreid_processor = TransReIDProcessor(model_path=args.transreid_model_path)
         self.weaviate_manager = WeaviateReIDManager(
@@ -1573,14 +825,13 @@ class C2Processor:
         self.existing_persons = 0
         self.stats_interval = 15
 
+    # ================= PREDICTION MODIFICATION 3 =================
     def process_object_predictions(self, data: Dict) -> List[Dict]:
-        """
-        Update the server-side object history and predict existing objects that
-        the sender intentionally omitted from a reduced GCL-update packet.
+        """Store actual observations and predict missing existing objects.
 
         Predictions are attached to ``predicted_existing_objects`` instead of
-        ``objects``. This is intentional: predicted records have no real image
-        crop and must not be passed to TransReID or stored as observations.
+        ``objects`` because they have no real crop or ReID embedding and must
+        not be stored as actual observations.
         """
         if self.object_predictor is None:
             return []
@@ -1591,15 +842,16 @@ class C2Processor:
         if not predictions:
             if self.object_predictor.prediction_requested(data):
                 print(
-                    "[PREDICTION] Reduced packet received, but no eligible "
+                    "[PREDICTION] Prediction was requested, but no eligible "
                     "existing tracks were found in server history"
                 )
             return []
 
         metadata = data.get("metadata", {})
-        frame_id = metadata.get("prediction_target_frame_id")
-        if frame_id is None:
-            frame_id = metadata.get("frame_id", "unknown")
+        frame_id = metadata.get(
+            "prediction_target_frame_id",
+            metadata.get("frame_id", "unknown"),
+        )
         camera_id = metadata.get("camera_id", "unknown")
         camera_location = metadata.get("camera_location", "unknown")
 
@@ -1609,7 +861,6 @@ class C2Processor:
             f"camera={camera_id} location={camera_location} "
             f"predicted_existing_objects={len(predictions)}"
         )
-
         for index, obj in enumerate(predictions):
             print(
                 f"  predicted object {index}: "
@@ -1621,14 +872,13 @@ class C2Processor:
                 f"direction={obj.get('direction')} "
                 f"speed_kmh={obj.get('speed_kmh')} "
                 f"predicted_fields={obj.get('predicted_fields')} "
-                f"prediction_confidence={obj.get('prediction_confidence')} "
-                f"speed_outlier={obj.get('speed_outlier')}"
+                f"source={obj.get('prediction_source')} "
+                f"confidence={obj.get('prediction_confidence')}"
             )
         print("=" * 80)
 
         if self.args.save_predictions:
             self.save_predicted_objects(data, predictions)
-
         return predictions
 
     def save_predicted_objects(self, data: Dict, predictions: List[Dict]):
@@ -1639,7 +889,6 @@ class C2Processor:
             "prediction_target_frame_id",
             metadata.get("frame_id", "unknown"),
         )
-
         safe_camera = "".join(
             character if character.isalnum() or character in "-_" else "_"
             for character in f"{camera_location}_{camera_id}"
@@ -1649,7 +898,6 @@ class C2Processor:
             self.args.prediction_output_dir,
             f"{safe_camera}_frame_{frame_id}_predicted.json",
         )
-
         output = {
             "type": "predicted_existing_objects",
             "metadata": {
@@ -1661,13 +909,13 @@ class C2Processor:
             },
             "objects": predictions,
         }
-
         try:
             with open(filename, "w") as prediction_file:
                 json.dump(output, prediction_file, indent=2, default=str)
             print(f"[PREDICTION SAVED] {filename}")
         except Exception as e:
             print(f"Could not save object predictions: {e}")
+    # =============== END PREDICTION MODIFICATION 3 ===============
 
 
     def print_statistics(self):
@@ -2020,9 +1268,11 @@ class C2Processor:
                     continue
 
                 if payload_type == "detected_objects":
-                    # This must run before process_detection(), because that
-                    # method filters the packet down to person crops for ReID.
+                    # ================= PREDICTION MODIFICATION 4 =================
+                    # Run before process_detection(), which filters the packet
+                    # down to person objects that contain real image crops.
                     predictions = self.process_object_predictions(data)
+                    # =============== END PREDICTION MODIFICATION 4 ===============
 
                     if not data.get("objects"):
                         status = "empty_object_packet"
@@ -2229,28 +1479,30 @@ def parse_args():
         "--verbose", action="store_true", help="Enable verbose debug output"
     )
 
+    # ================= PREDICTION MODIFICATION 5 =================
+    # Runtime and optional trained-model configuration.
     parser.add_argument(
         "--disable_object_prediction",
         action="store_true",
-        help="Disable history-based prediction for omitted existing objects",
+        help="Disable server-side prediction of omitted existing objects",
     )
     parser.add_argument(
         "--camera_fps",
         type=float,
         default=25.0,
-        help="Source FPS used when capture timestamps are not transmitted",
+        help="Source FPS used when capture timestamps are unavailable",
     )
     parser.add_argument(
         "--prediction_history",
         type=int,
         default=10,
-        help="Maximum number of actual observations retained per track",
+        help="Number of actual observations retained and fed to the model",
     )
     parser.add_argument(
         "--prediction_max_missed",
         type=int,
         default=3,
-        help="Maximum number of consecutive frames for track prediction",
+        help="Maximum number of consecutive frames predicted per track",
     )
     parser.add_argument(
         "--prediction_max_speed_kmh",
@@ -2259,16 +1511,34 @@ def parse_args():
         help="Maximum plausible radial speed used to limit distance outliers",
     )
     parser.add_argument(
-        "--prediction_frame_width",
-        type=int,
-        default=1920,
-        help="Default frame width used to clip predicted bounding boxes",
+        "--prediction_frame_width", type=int, default=1920
     )
     parser.add_argument(
-        "--prediction_frame_height",
-        type=int,
-        default=1080,
-        help="Default frame height used to clip predicted bounding boxes",
+        "--prediction_frame_height", type=int, default=1080
+    )
+    parser.add_argument(
+        "--prediction_max_distance_m", type=float, default=500.0
+    )
+    parser.add_argument(
+        "--prediction_max_bearing_deg", type=float, default=45.0
+    )
+    parser.add_argument(
+        "--prediction_model_path",
+        type=str,
+        default=None,
+        help="Optional trained ObjectMotionGRU checkpoint",
+    )
+    parser.add_argument(
+        "--prediction_device",
+        type=str,
+        default="auto",
+        help="Prediction model device: auto, cpu, cuda, or cuda:N",
+    )
+    parser.add_argument(
+        "--prediction_hidden_size", type=int, default=128
+    )
+    parser.add_argument(
+        "--prediction_num_layers", type=int, default=2
     )
     parser.add_argument(
         "--save_predictions",
@@ -2279,8 +1549,9 @@ def parse_args():
         "--prediction_output_dir",
         type=str,
         default="predicted_objects",
-        help="Directory used by --save_predictions",
+        help="Output directory used with --save_predictions",
     )
+    # =============== END PREDICTION MODIFICATION 5 ===============
 
     return parser.parse_args()
 

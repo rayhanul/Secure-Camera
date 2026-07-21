@@ -1,181 +1,95 @@
-"""Server-side existing-object prediction for GCL reconfiguration.
-
-This module owns three responsibilities:
-
-1. Store only real object observations in a bounded history per
-   ``(camera_id, camera_location, track_id)``.
-2. Convert that history into a normalized tensor for a GRU model.
-3. Fill missing properties of omitted or partial existing objects.
-
-A trained GRU checkpoint is optional. If no checkpoint is supplied, the
-predictor uses a robust median-slope motion model. Predictions are never added
-back to history, which prevents recursive prediction drift.
-"""
-
+import argparse
+import json
+import os
+import time
+import socket
+import zlib
+import base64
+import time
 from collections import Counter, deque
 from datetime import datetime
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional
 
+import cv2
 import numpy as np
 import torch
-from torch import nn
+from torchvision import transforms as T
+from utils.image_utils import encode_image_to_base64
+from utils.reid_result import ReIDResult  # Just a data class
+from utils.results_saver import ReIDResultsSaver
+from utils.storage import SecureReIDStorage
+
+# TransReID imports will be handled within the TransReIDProcessor class
+from utils.util import objects_to_tensor
+from utils.weaviate import ReIDVectorStore
 
 
-BASE_FEATURE_NAMES = (
-    "cx",
-    "cy",
-    "width",
-    "height",
-    "distance_m",
-    "bearing_deg",
-    "confidence",
-    "delta_time",
-)
-MODEL_INPUT_SIZE = len(BASE_FEATURE_NAMES) * 2  # values + validity masks
-MODEL_OUTPUT_SIZE = 6  # delta cx, cy, width, height, distance, bearing
+import struct
+
+MAX_DGRAM = 60000
+
+SINGLE_PACKET_TYPE = 0
+CHUNK_PACKET_TYPE = 1
+
+HEADER_FORMAT = "!HIHH"
+HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 
 
-def parse_timestamp(value, fallback: float) -> float:
-    """Parse numeric or ISO timestamps without using server-arrival time."""
-    if value is None:
-        return fallback
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
+import pdb; 
+
+
+import sys
+
+TRANSREID_ROOT = "/home/jdg24001/Documents/github/Secure-Camera/C2/TransReID"
+
+if TRANSREID_ROOT not in sys.path:
+    sys.path.insert(0, TRANSREID_ROOT)
+    
+    
+
+def parse_timestamp(timestamp_value):
+    if timestamp_value is None:
+        return time.time()
+
+    if isinstance(timestamp_value, int) or isinstance(timestamp_value, float):
+        return float(timestamp_value)
+
+    if isinstance(timestamp_value, str):
         try:
-            return float(value)
+            return float(timestamp_value)
         except ValueError:
             try:
-                iso_value = value.replace("Z", "+00:00")
-                return datetime.fromisoformat(iso_value).timestamp()
+                return datetime.fromisoformat(timestamp_value).timestamp()
             except ValueError:
-                return fallback
-    return fallback
+                return time.time()
 
-
-def history_to_model_tensor(
-    history: Sequence[Dict],
-    history_size: int,
-    frame_width: int,
-    frame_height: int,
-    fps: float,
-    max_distance_m: float = 500.0,
-    max_bearing_deg: float = 45.0,
-    device: Optional[torch.device] = None,
-) -> torch.Tensor:
-    """Convert one track history to ``[batch, time, features]``.
-
-    Missing numerical values are stored as zero and accompanied by a validity
-    mask, allowing the model to distinguish missing data from a real zero.
-    Histories shorter than ``history_size`` are left-padded with zeros.
-    """
-    history_size = max(int(history_size), 2)
-    frame_width = max(int(frame_width), 1)
-    frame_height = max(int(frame_height), 1)
-    fps = max(float(fps), 0.001)
-    max_distance_m = max(float(max_distance_m), 0.001)
-    max_bearing_deg = max(float(max_bearing_deg), 0.001)
-
-    rows: List[np.ndarray] = []
-    previous_timestamp = None
-
-    for observation in list(history)[-history_size:]:
-        timestamp = _as_float(observation.get("timestamp"))
-        if timestamp is None:
-            timestamp = 0.0 if previous_timestamp is None else previous_timestamp
-
-        if previous_timestamp is None:
-            delta_time_in_frames = 0.0
-        else:
-            delta_time_in_frames = max(
-                0.0,
-                min(5.0, (timestamp - previous_timestamp) * fps),
-            )
-
-        raw_values = (
-            _as_float(observation.get("cx")),
-            _as_float(observation.get("cy")),
-            _as_float(observation.get("width")),
-            _as_float(observation.get("height")),
-            _as_float(observation.get("distance_m")),
-            _as_float(observation.get("bearing_deg")),
-            _as_float(observation.get("confidence")),
-            delta_time_in_frames,
-        )
-        scales = (
-            frame_width,
-            frame_height,
-            frame_width,
-            frame_height,
-            max_distance_m,
-            max_bearing_deg,
-            1.0,
-            1.0,
-        )
-
-        values = []
-        masks = []
-        for value, scale in zip(raw_values, scales):
-            valid = value is not None and np.isfinite(value)
-            masks.append(1.0 if valid else 0.0)
-            values.append(float(value) / scale if valid else 0.0)
-
-        rows.append(
-            np.asarray(values + masks, dtype=np.float32)
-        )
-        previous_timestamp = timestamp
-
-    pad_count = history_size - len(rows)
-    if pad_count > 0:
-        padding = [
-            np.zeros(MODEL_INPUT_SIZE, dtype=np.float32)
-            for _ in range(pad_count)
-        ]
-        rows = padding + rows
-
-    if not rows:
-        rows = [
-            np.zeros(MODEL_INPUT_SIZE, dtype=np.float32)
-            for _ in range(history_size)
-        ]
-
-    tensor = torch.tensor(np.stack(rows), dtype=torch.float32).unsqueeze(0)
-    if device is not None:
-        tensor = tensor.to(device)
-    return tensor
-
-
-class ObjectMotionGRU(nn.Module):
-    """GRU that predicts normalized changes in six object-state values."""
-
-    def __init__(
-        self,
-        input_size: int = MODEL_INPUT_SIZE,
-        hidden_size: int = 128,
-        num_layers: int = 2,
-        dropout: float = 0.2,
-    ):
-        super().__init__()
-        self.gru = nn.GRU(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            dropout=dropout if num_layers > 1 else 0.0,
-            batch_first=True,
-        )
-        self.output_head = nn.Sequential(
-            nn.Linear(hidden_size, 64),
-            nn.ReLU(),
-            nn.Linear(64, MODEL_OUTPUT_SIZE),
-        )
-
-    def forward(self, model_input: torch.Tensor) -> torch.Tensor:
-        sequence_output, _ = self.gru(model_input)
-        return self.output_head(sequence_output[:, -1, :])
+    return time.time()
 
 
 class ExistingObjectPredictor:
-    """Store actual histories and predict omitted/partial existing tracks."""
+    """
+    Predict properties of known tracks when the sender transmits only newly
+    detected objects during a GCL update.
+
+    The sender must explicitly mark a reduced packet. Supported markers are:
+
+        metadata["existing_objects_omitted"] = True
+        metadata["prediction_required"] = True
+        metadata["transmission_mode"] = "new_objects_only"
+        metadata["object_data_empty"] = True
+        metadata["existing_track_ids"] = [4, 28, 32]
+
+    If possible, the sender should also include ``omitted_track_ids``. Without
+    that list, every recently observed track that is missing from the packet is
+    treated as an omitted existing object for a small number of frames.
+
+    A received known track can also contain partial/empty properties. In that
+    case the predictor keeps every valid transmitted value and fills only the
+    missing bbox, distance, bearing, direction, and speed fields from history.
+
+    Only actual observations are added to history. Predicted observations are
+    never fed back into the predictor, which prevents prediction drift.
+    """
 
     REDUCED_TRANSMISSION_MODES = {
         "new_objects_only",
@@ -189,18 +103,12 @@ class ExistingObjectPredictor:
 
     def __init__(
         self,
-        fps: float = 25.0,
-        history_size: int = 10,
-        max_missed_frames: int = 3,
-        max_radial_speed_kmh: float = 180.0,
-        frame_width: int = 1920,
-        frame_height: int = 1080,
-        model_path: Optional[str] = None,
-        model_device: str = "auto",
-        model_hidden_size: int = 128,
-        model_num_layers: int = 2,
-        max_distance_m: float = 500.0,
-        max_bearing_deg: float = 45.0,
+        fps=25.0,
+        history_size=10,
+        max_missed_frames=3,
+        max_radial_speed_kmh=180.0,
+        frame_width=1920,
+        frame_height=1080,
     ):
         self.fps = max(float(fps), 0.001)
         self.history_size = max(int(history_size), 2)
@@ -208,75 +116,13 @@ class ExistingObjectPredictor:
         self.max_radial_speed_kmh = max(float(max_radial_speed_kmh), 1.0)
         self.default_frame_width = max(int(frame_width), 1)
         self.default_frame_height = max(int(frame_height), 1)
-        self.max_distance_m = max(float(max_distance_m), 0.001)
-        self.max_bearing_deg = max(float(max_bearing_deg), 0.001)
 
-        self.track_histories: Dict[Tuple[Tuple[str, str], str], deque] = {}
-        self.latest_frame_by_camera: Dict[Tuple[str, str], int] = {}
-
-        self.model = None
-        self.model_device = self._resolve_device(model_device)
-        if model_path:
-            self.load_model(
-                model_path=model_path,
-                hidden_size=model_hidden_size,
-                num_layers=model_num_layers,
-            )
-
-    @property
-    def model_enabled(self) -> bool:
-        return self.model is not None
+        # Key: ((camera_id, camera_location), string_track_id)
+        self.track_histories = {}
+        self.latest_frame_by_camera = {}
 
     @staticmethod
-    def _resolve_device(requested: str) -> torch.device:
-        requested = str(requested or "auto").lower()
-        if requested == "auto":
-            requested = "cuda" if torch.cuda.is_available() else "cpu"
-        if requested.startswith("cuda") and not torch.cuda.is_available():
-            requested = "cpu"
-        return torch.device(requested)
-
-    def load_model(
-        self,
-        model_path: str,
-        hidden_size: int = 128,
-        num_layers: int = 2,
-    ) -> bool:
-        """Load a trained checkpoint; retain robust fallback on failure."""
-        try:
-            checkpoint = torch.load(model_path, map_location=self.model_device)
-            state_dict = checkpoint
-            if isinstance(checkpoint, dict):
-                state_dict = checkpoint.get(
-                    "model_state_dict",
-                    checkpoint.get("state_dict", checkpoint),
-                )
-                config = checkpoint.get("model_config", {})
-                hidden_size = int(config.get("hidden_size", hidden_size))
-                num_layers = int(config.get("num_layers", num_layers))
-
-            model = ObjectMotionGRU(
-                hidden_size=hidden_size,
-                num_layers=num_layers,
-            ).to(self.model_device)
-            model.load_state_dict(state_dict, strict=True)
-            model.eval()
-            self.model = model
-            print(
-                f"Object prediction GRU loaded from {model_path} "
-                f"on {self.model_device}"
-            )
-            return True
-        except Exception as error:
-            self.model = None
-            print(
-                "Could not load object prediction GRU; using robust history "
-                f"fallback: {error}"
-            )
-            return False
-
-    @staticmethod
-    def _first_value(mapping: Dict, *names, default=None):
+    def _first_value(mapping, *names, default=None):
         for name in names:
             value = mapping.get(name)
             if value is not None:
@@ -284,51 +130,95 @@ class ExistingObjectPredictor:
         return default
 
     @staticmethod
-    def _camera_key(metadata: Dict) -> Tuple[str, str]:
-        return (
-            str(metadata.get("camera_id", "unknown")),
-            str(metadata.get("camera_location", "unknown")),
-        )
+    def _as_int(value, default=None):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
 
     @staticmethod
-    def _track_key(track_id) -> str:
+    def _as_float(value, default=None):
+        try:
+            result = float(value)
+            if np.isfinite(result):
+                return result
+        except (TypeError, ValueError):
+            pass
+        return default
+
+    @staticmethod
+    def _camera_key(metadata):
+        camera_id = metadata.get("camera_id", "unknown")
+        camera_location = metadata.get("camera_location", "unknown")
+        return str(camera_id), str(camera_location)
+
+    @staticmethod
+    def _track_key(track_id):
         return str(track_id)
 
     @staticmethod
-    def _has_text(value) -> bool:
+    def _has_text(value):
         if value is None:
             return False
-        return str(value).strip().lower() not in {
-            "", "none", "null", "nan", "unknown"
-        }
+        text = str(value).strip().lower()
+        return text not in {"", "none", "null", "nan", "unknown"}
 
-    def _valid_bbox(self, obj: Dict) -> Optional[List[float]]:
+    def _valid_bbox(self, obj):
         bbox = obj.get("bbox")
         if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
             return None
-        coords = [_as_float(value) for value in bbox]
+
+        coords = [self._as_float(value) for value in bbox]
         if any(value is None for value in coords):
             return None
+
         x1, y1, x2, y2 = coords
         if x2 <= x1 or y2 <= y1:
             return None
         return coords
 
-    def _missing_prediction_fields(self, obj: Dict) -> List[str]:
+    def _missing_prediction_fields(self, obj):
+        """Return motion/property fields that are empty in a descriptor."""
         missing = []
         if self._valid_bbox(obj) is None:
             missing.append("bbox")
-        if _first_float(obj, "distance_m", "distance") is None:
+        if self._as_float(
+            self._first_value(obj, "distance_m", "distance")
+        ) is None:
             missing.append("distance_m")
-        if _first_float(obj, "bearing_deg", "bearing_angle") is None:
+        if self._as_float(
+            self._first_value(obj, "bearing_deg", "bearing_angle")
+        ) is None:
             missing.append("bearing_deg")
-        if not _first_text(obj, "direction", "motion_direction"):
+        if not self._has_text(
+            self._first_value(obj, "direction", "motion_direction")
+        ):
             missing.append("direction")
-        if _first_float(obj, "speed_kmh", "speed") is None:
+        if self._as_float(
+            self._first_value(obj, "speed_kmh", "speed")
+        ) is None:
             missing.append("speed_kmh")
         return missing
 
-    def prediction_requested(self, data: Dict) -> bool:
+    def _frame_id(self, metadata, camera_key):
+        frame_id = self._as_int(metadata.get("frame_id"))
+        if frame_id is not None:
+            return frame_id
+        return self.latest_frame_by_camera.get(camera_key, -1) + 1
+
+    def _frame_timestamp(self, metadata, frame_id):
+        timestamp_value = self._first_value(
+            metadata,
+            "capture_timestamp",
+            "timestamp",
+            "timestamp_s",
+        )
+        if timestamp_value is None:
+            # Video/source time is more stable than packet-arrival time.
+            return float(frame_id) / self.fps
+        return parse_timestamp(timestamp_value)
+
+    def prediction_requested(self, data):
         metadata = data.get("metadata", {})
         mode = str(
             self._first_value(
@@ -337,124 +227,147 @@ class ExistingObjectPredictor:
                 default=data.get("transmission_mode", ""),
             )
         ).lower()
+
         return bool(
             metadata.get("existing_objects_omitted")
             or metadata.get("prediction_required")
             or metadata.get("object_data_empty")
             or metadata.get("existing_object_data_empty")
-            or metadata.get("existing_track_ids")
             or data.get("existing_objects_omitted")
             or data.get("prediction_required")
             or data.get("object_data_empty")
             or data.get("existing_object_data_empty")
+            or metadata.get("existing_track_ids")
             or data.get("existing_track_ids")
             or mode in self.REDUCED_TRANSMISSION_MODES
         )
 
-    def _frame_id(self, metadata: Dict, camera_key: Tuple[str, str]) -> int:
-        frame_id = _as_int(metadata.get("frame_id"))
-        if frame_id is not None:
-            return frame_id
-        return self.latest_frame_by_camera.get(camera_key, -1) + 1
-
-    def _frame_timestamp(self, metadata: Dict, frame_id: int) -> float:
-        value = self._first_value(
-            metadata,
-            "capture_timestamp",
-            "timestamp",
-            "timestamp_s",
-        )
-        return parse_timestamp(value, float(frame_id) / self.fps)
-
     def _normalize_observation(
         self,
-        obj: Dict,
-        frame_id: int,
-        timestamp: float,
-    ) -> Optional[Dict]:
-        track_id = self._first_value(
-            obj, "track_id", "object_track_id", "object_id"
-        )
-        bbox = self._valid_bbox(obj)
-        if track_id is None or bbox is None:
+        obj,
+        frame_id,
+        timestamp,
+    ):
+        track_id = self._first_value(obj, "track_id", "object_track_id")
+        if track_id is None:
+            # object_id is safe only when the sender makes it persistent.
+            track_id = obj.get("object_id")
+        if track_id is None:
             return None
-        x1, y1, x2, y2 = bbox
-        return {
+
+        coords = self._valid_bbox(obj)
+        if coords is None:
+            return None
+        x1, y1, x2, y2 = coords
+
+        distance = self._as_float(
+            self._first_value(obj, "distance_m", "distance")
+        )
+        bearing = self._as_float(
+            self._first_value(obj, "bearing_deg", "bearing_angle")
+        )
+
+        observation = {
             "frame_id": frame_id,
             "timestamp": timestamp,
             "track_id": track_id,
             "class_name": self._first_value(
-                obj, "class_name", "class", default="unknown"
+                obj,
+                "class_name",
+                "class",
+                default="unknown",
             ),
             "class_id": obj.get("class_id"),
-            "confidence": _as_float(obj.get("confidence"), 0.0),
+            "confidence": self._as_float(obj.get("confidence"), 0.0),
             "cx": (x1 + x2) / 2.0,
             "cy": (y1 + y2) / 2.0,
             "width": x2 - x1,
             "height": y2 - y1,
-            "distance_m": _first_float(obj, "distance_m", "distance"),
-            "bearing_deg": _first_float(obj, "bearing_deg", "bearing_angle"),
-            "speed_kmh": _first_float(obj, "speed_kmh", "speed"),
-            "direction": _first_text(
-                obj, "direction", "motion_direction"
-            ) or "unknown",
-            "jpeg_crop_size": _as_float(obj.get("jpeg_crop_size")),
-            "serialized_object_size": _as_float(
+            "distance_m": distance,
+            "bearing_deg": bearing,
+            "speed_kmh": self._as_float(
+                self._first_value(obj, "speed_kmh", "speed")
+            ),
+            "direction": self._first_value(
+                obj,
+                "direction",
+                "motion_direction",
+                default="unknown",
+            ),
+            "jpeg_crop_size": self._as_float(obj.get("jpeg_crop_size")),
+            "serialized_object_size": self._as_float(
                 obj.get("serialized_object_size")
             ),
             "privacy_level": obj.get("privacy_level"),
             "global_person_id": self._first_value(
-                obj, "global_person_id", "person_id"
+                obj,
+                "global_person_id",
+                "person_id",
             ),
         }
+        return observation
 
     def _observe_actual_objects(
         self,
-        camera_key: Tuple[str, str],
-        frame_id: int,
-        timestamp: float,
-        objects: Iterable[Dict],
-    ) -> None:
+        camera_key,
+        frame_id,
+        timestamp,
+        objects,
+    ):
         for obj in objects:
             observation = self._normalize_observation(
-                obj, frame_id, timestamp
+                obj,
+                frame_id,
+                timestamp,
             )
             if observation is None:
                 continue
+
             key = (camera_key, self._track_key(observation["track_id"]))
-            history = self.track_histories.setdefault(
-                key, deque(maxlen=self.history_size)
-            )
+            history = self.track_histories.get(key)
+            if history is None:
+                history = deque(maxlen=self.history_size)
+                self.track_histories[key] = history
+
             if history and frame_id <= history[-1]["frame_id"]:
                 continue
+
             history.append(observation)
 
-    @staticmethod
     def _robust_extrapolate(
-        history: Sequence[Dict],
-        field: str,
-        target_timestamp: float,
-        maximum_absolute_rate: Optional[float] = None,
-    ) -> Tuple[Optional[float], float, float]:
+        self,
+        history,
+        field,
+        target_timestamp,
+        maximum_absolute_rate=None,
+    ):
         points = []
         for observation in history:
-            value = _as_float(observation.get(field))
-            timestamp = _as_float(observation.get("timestamp"))
+            value = self._as_float(observation.get(field))
+            timestamp = self._as_float(observation.get("timestamp"))
             if value is not None and timestamp is not None:
                 points.append((timestamp, value))
+
         if not points:
             return None, 0.0, 0.0
         if len(points) == 1:
             return points[-1][1], 0.0, 0.0
 
         slopes = []
-        for first in range(len(points)):
-            for second in range(first + 1, len(points)):
-                delta_time = points[second][0] - points[first][0]
+        for first_index in range(len(points)):
+            for second_index in range(first_index + 1, len(points)):
+                delta_time = (
+                    points[second_index][0] - points[first_index][0]
+                )
                 if delta_time > 0:
                     slopes.append(
-                        (points[second][1] - points[first][1]) / delta_time
+                        (
+                            points[second_index][1]
+                            - points[first_index][1]
+                        )
+                        / delta_time
                     )
+
         if not slopes:
             return points[-1][1], 0.0, 0.0
 
@@ -462,175 +375,143 @@ class ExistingObjectPredictor:
         used_rate = raw_rate
         if maximum_absolute_rate is not None:
             used_rate = float(
-                np.clip(raw_rate, -maximum_absolute_rate, maximum_absolute_rate)
+                np.clip(
+                    used_rate,
+                    -maximum_absolute_rate,
+                    maximum_absolute_rate,
+                )
             )
-        horizon = max(0.0, target_timestamp - points[-1][0])
-        return points[-1][1] + used_rate * horizon, used_rate, raw_rate
 
-    def _model_state(
-        self,
-        history: Sequence[Dict],
-        frame_width: int,
-        frame_height: int,
-        horizon_frames: int,
-    ) -> Optional[Dict]:
-        if self.model is None or not history:
-            return None
-        last = history[-1]
-        required = (
-            "cx", "cy", "width", "height", "distance_m", "bearing_deg"
-        )
-        if any(_as_float(last.get(field)) is None for field in required):
-            return None
-
-        model_input = history_to_model_tensor(
-            history=history,
-            history_size=self.history_size,
-            frame_width=frame_width,
-            frame_height=frame_height,
-            fps=self.fps,
-            max_distance_m=self.max_distance_m,
-            max_bearing_deg=self.max_bearing_deg,
-            device=self.model_device,
-        )
-        with torch.no_grad():
-            delta = self.model(model_input)[0].detach().cpu().numpy()
-
-        horizon_frames = max(int(horizon_frames), 1)
-        scales = np.asarray(
-            [
-                frame_width,
-                frame_height,
-                frame_width,
-                frame_height,
-                self.max_distance_m,
-                self.max_bearing_deg,
-            ],
-            dtype=np.float32,
-        )
-        last_state = np.asarray(
-            [last[field] for field in required], dtype=np.float32
-        )
-        predicted = last_state + delta * scales * horizon_frames
-        return {
-            "cx": float(predicted[0]),
-            "cy": float(predicted[1]),
-            "width": max(2.0, float(predicted[2])),
-            "height": max(2.0, float(predicted[3])),
-            "distance_m": max(0.0, float(predicted[4])),
-            "bearing_deg": float(predicted[5]),
-            "model_input_shape": list(model_input.shape),
-        }
+        last_timestamp, last_value = points[-1]
+        prediction_horizon = max(0.0, target_timestamp - last_timestamp)
+        prediction = last_value + used_rate * prediction_horizon
+        return prediction, used_rate, raw_rate
 
     def _predict_track(
         self,
-        history: Sequence[Dict],
-        target_frame_id: int,
-        target_timestamp: float,
-        frame_width: int,
-        frame_height: int,
-    ) -> Optional[Dict]:
+        history,
+        target_frame_id,
+        target_timestamp,
+        frame_width,
+        frame_height,
+    ):
         last = history[-1]
-        frames_since = target_frame_id - last["frame_id"]
-        if frames_since <= 0 or frames_since > self.max_missed_frames:
+        frames_since_observation = target_frame_id - last["frame_id"]
+        if frames_since_observation <= 0:
+            return None
+        if frames_since_observation > self.max_missed_frames:
             return None
 
-        cx, _, _ = self._robust_extrapolate(history, "cx", target_timestamp)
-        cy, _, _ = self._robust_extrapolate(history, "cy", target_timestamp)
+        cx, _, _ = self._robust_extrapolate(
+            history, "cx", target_timestamp
+        )
+        cy, _, _ = self._robust_extrapolate(
+            history, "cy", target_timestamp
+        )
         width, _, _ = self._robust_extrapolate(
             history, "width", target_timestamp
         )
         height, _, _ = self._robust_extrapolate(
             history, "height", target_timestamp
         )
+
+        if None in (cx, cy, width, height):
+            return None
+
+        width = max(2.0, width)
+        height = max(2.0, height)
+
+        x1 = int(round(cx - width / 2.0))
+        y1 = int(round(cy - height / 2.0))
+        x2 = int(round(cx + width / 2.0))
+        y2 = int(round(cy + height / 2.0))
+
+        x1 = int(np.clip(x1, 0, frame_width - 1))
+        y1 = int(np.clip(y1, 0, frame_height - 1))
+        x2 = int(np.clip(x2, 0, frame_width - 1))
+        y2 = int(np.clip(y2, 0, frame_height - 1))
+        if x2 <= x1 or y2 <= y1:
+            return None
+
+        maximum_distance_rate = self.max_radial_speed_kmh / 3.6
         distance, distance_rate, raw_distance_rate = self._robust_extrapolate(
             history,
             "distance_m",
             target_timestamp,
-            self.max_radial_speed_kmh / 3.6,
+            maximum_absolute_rate=maximum_distance_rate,
         )
         bearing, _, _ = self._robust_extrapolate(
-            history, "bearing_deg", target_timestamp, 120.0
+            history,
+            "bearing_deg",
+            target_timestamp,
+            maximum_absolute_rate=120.0,
         )
-        if None in (cx, cy, width, height):
-            return None
 
-        source = "robust_history"
-        model_input_shape = None
-        model_state = self._model_state(
-            history, frame_width, frame_height, frames_since
+        predicted_crop_size, _, _ = self._robust_extrapolate(
+            history,
+            "jpeg_crop_size",
+            target_timestamp,
         )
-        if model_state is not None:
-            cx = model_state["cx"]
-            cy = model_state["cy"]
-            width = model_state["width"]
-            height = model_state["height"]
-            distance = model_state["distance_m"]
-            bearing = model_state["bearing_deg"]
-            model_input_shape = model_state["model_input_shape"]
-            source = "gru_model"
-
-            last_distance = _as_float(last.get("distance_m"))
-            delta_time = max(target_timestamp - last["timestamp"], 1.0 / self.fps)
-            if last_distance is not None:
-                raw_distance_rate = (distance - last_distance) / delta_time
-                distance_rate = float(
-                    np.clip(
-                        raw_distance_rate,
-                        -self.max_radial_speed_kmh / 3.6,
-                        self.max_radial_speed_kmh / 3.6,
-                    )
-                )
-                distance = last_distance + distance_rate * delta_time
-
-        width = max(2.0, width)
-        height = max(2.0, height)
-        bbox = [
-            int(np.clip(round(cx - width / 2.0), 0, frame_width - 1)),
-            int(np.clip(round(cy - height / 2.0), 0, frame_height - 1)),
-            int(np.clip(round(cx + width / 2.0), 0, frame_width - 1)),
-            int(np.clip(round(cy + height / 2.0), 0, frame_height - 1)),
-        ]
-        if bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
-            return None
-
-        speed_kmh = abs(distance_rate) * 3.6 if distance is not None else 0.0
-        raw_speed_kmh = (
-            abs(raw_distance_rate) * 3.6 if distance is not None else 0.0
+        predicted_serialized_size, _, _ = self._robust_extrapolate(
+            history,
+            "serialized_object_size",
+            target_timestamp,
         )
-        if speed_kmh < 2.0:
-            direction = "stationary"
-        elif distance_rate < 0:
-            direction = "approaching"
-        else:
-            direction = "moving_away"
 
-        class_name = Counter(
+        recent_classes = [
             str(item.get("class_name", "unknown")) for item in history
-        ).most_common(1)[0][0]
-        confidence = float(
-            np.median(
-                [
-                    _as_float(item.get("confidence"), 0.0)
-                    for item in list(history)[-3:]
-                ]
-            )
-        )
+        ]
+        class_name = Counter(recent_classes).most_common(1)[0][0]
+        recent_confidences = [
+            self._as_float(item.get("confidence"), 0.0)
+            for item in list(history)[-3:]
+        ]
+        expected_detector_confidence = float(np.median(recent_confidences))
+
+        history_support = min(1.0, len(history) / 3.0)
         prediction_confidence = (
-            confidence * min(1.0, len(history) / 3.0) * 0.85 ** frames_since
+            expected_detector_confidence
+            * history_support
+            * (0.85 ** frames_since_observation)
         )
+
+        if distance is None:
+            speed_kmh = self._as_float(
+                self._first_value(last, "speed_kmh", "speed"),
+                0.0,
+            )
+            raw_speed_kmh = speed_kmh
+            direction = self._first_value(
+                last,
+                "direction",
+                "motion_direction",
+                default="unknown",
+            )
+        else:
+            speed_kmh = abs(distance_rate) * 3.6
+            raw_speed_kmh = abs(raw_distance_rate) * 3.6
+            if speed_kmh < 2.0:
+                direction = "stationary"
+            elif distance_rate < 0:
+                direction = "approaching"
+            else:
+                direction = "moving_away"
 
         prediction = {
             "object_id": f"predicted_{last['track_id']}",
             "track_id": last["track_id"],
             "class_name": class_name,
             "class_id": last.get("class_id"),
-            "confidence": round(confidence, 6),
-            "bbox": bbox,
+            "confidence": round(expected_detector_confidence, 6),
+            "bbox": [x1, y1, x2, y2],
             "distance_m": (
-                round(max(0.0, distance), 3) if distance is not None else None
+                round(max(0.0, distance), 3)
+                if distance is not None
+                else None
             ),
-            "bearing_deg": round(bearing, 2) if bearing is not None else None,
+            "bearing_deg": (
+                round(bearing, 2) if bearing is not None else None
+            ),
             "direction": direction,
             "speed_kmh": round(speed_kmh, 3),
             "raw_speed_kmh": round(raw_speed_kmh, 3),
@@ -641,87 +522,120 @@ class ExistingObjectPredictor:
             "predicted_for_frame_id": target_frame_id,
             "timestamp": target_timestamp,
             "predicted": True,
-            "prediction_source": source,
+            "prediction_source": "server_track_history",
             "actual_payload_pending": True,
             "has_crop": False,
             "has_processed": False,
         }
-        if model_input_shape is not None:
-            prediction["model_input_shape"] = model_input_shape
 
-        for size_field in ("jpeg_crop_size", "serialized_object_size"):
-            predicted_size, _, _ = self._robust_extrapolate(
-                history, size_field, target_timestamp
+        if predicted_crop_size is not None:
+            prediction["jpeg_crop_size"] = int(
+                round(max(0.0, predicted_crop_size))
             )
-            if predicted_size is not None:
-                prediction[size_field] = int(round(max(0.0, predicted_size)))
-        for identity_field in ("privacy_level", "global_person_id"):
-            if last.get(identity_field) is not None:
-                prediction[identity_field] = last[identity_field]
+        if predicted_serialized_size is not None:
+            prediction["serialized_object_size"] = int(
+                round(max(0.0, predicted_serialized_size))
+            )
+        if last.get("privacy_level") is not None:
+            prediction["privacy_level"] = last["privacy_level"]
+        if last.get("global_person_id") is not None:
+            prediction["global_person_id"] = last["global_person_id"]
+
         return prediction
 
     def _merge_partial_descriptor(
         self,
-        prediction: Dict,
-        partial_object: Dict,
-        missing_fields: Sequence[str],
-        history: Sequence[Dict],
-        target_timestamp: float,
-    ) -> Dict:
+        prediction,
+        partial_object,
+        missing_fields,
+        history,
+        target_timestamp,
+    ):
+        """
+        Keep valid transmitted values and use the history prediction only for
+        fields that are empty in an existing-object descriptor.
+        """
         prediction = dict(prediction)
+
         actual_bbox = self._valid_bbox(partial_object)
         if actual_bbox is not None:
             prediction["bbox"] = [int(round(value)) for value in actual_bbox]
 
-        actual_distance = _first_float(
-            partial_object, "distance_m", "distance"
-        )
-        actual_bearing = _first_float(
-            partial_object, "bearing_deg", "bearing_angle"
-        )
-        actual_speed = _first_float(partial_object, "speed_kmh", "speed")
-        actual_direction = _first_text(
-            partial_object, "direction", "motion_direction"
+        actual_distance = self._as_float(
+            self._first_value(partial_object, "distance_m", "distance")
         )
         if actual_distance is not None:
             prediction["distance_m"] = round(max(0.0, actual_distance), 3)
+
+        actual_bearing = self._as_float(
+            self._first_value(
+                partial_object,
+                "bearing_deg",
+                "bearing_angle",
+            )
+        )
         if actual_bearing is not None:
             prediction["bearing_deg"] = round(actual_bearing, 2)
+
+        actual_direction = self._first_value(
+            partial_object,
+            "direction",
+            "motion_direction",
+        )
+        if self._has_text(actual_direction):
+            prediction["direction"] = str(actual_direction)
+
+        actual_speed = self._as_float(
+            self._first_value(partial_object, "speed_kmh", "speed")
+        )
         if actual_speed is not None:
             prediction["speed_kmh"] = round(max(0.0, actual_speed), 3)
             prediction["raw_speed_kmh"] = round(max(0.0, actual_speed), 3)
             prediction["speed_outlier"] = (
                 actual_speed > self.max_radial_speed_kmh
             )
-        if actual_direction:
-            prediction["direction"] = actual_direction
 
+        # If current distance is real but speed/direction are empty, include
+        # that distance in a temporary slope calculation. This temporary point
+        # is not stored as a complete observation unless a real bbox exists.
         if actual_distance is not None and (
             "speed_kmh" in missing_fields or "direction" in missing_fields
         ):
-            points = list(history) + [
-                {"timestamp": target_timestamp, "distance_m": actual_distance}
-            ]
-            _, rate, raw_rate = self._robust_extrapolate(
-                points,
+            distance_points = list(history)
+            distance_points.append(
+                {
+                    "timestamp": target_timestamp,
+                    "distance_m": actual_distance,
+                }
+            )
+            _, distance_rate, raw_distance_rate = self._robust_extrapolate(
+                distance_points,
                 "distance_m",
                 target_timestamp,
-                self.max_radial_speed_kmh / 3.6,
+                maximum_absolute_rate=self.max_radial_speed_kmh / 3.6,
             )
-            derived_speed = abs(rate) * 3.6
+            derived_speed = abs(distance_rate) * 3.6
+            raw_derived_speed = abs(raw_distance_rate) * 3.6
+
             if "speed_kmh" in missing_fields:
                 prediction["speed_kmh"] = round(derived_speed, 3)
-                prediction["raw_speed_kmh"] = round(abs(raw_rate) * 3.6, 3)
-                prediction["speed_outlier"] = (
-                    abs(raw_rate) * 3.6 > self.max_radial_speed_kmh
+                prediction["raw_speed_kmh"] = round(
+                    raw_derived_speed,
+                    3,
                 )
-            if "direction" in missing_fields:
-                prediction["direction"] = (
-                    "stationary"
-                    if derived_speed < 2.0
-                    else "approaching" if rate < 0 else "moving_away"
+                prediction["speed_outlier"] = (
+                    raw_derived_speed > self.max_radial_speed_kmh
                 )
 
+            if "direction" in missing_fields:
+                if derived_speed < 2.0:
+                    prediction["direction"] = "stationary"
+                elif distance_rate < 0:
+                    prediction["direction"] = "approaching"
+                else:
+                    prediction["direction"] = "moving_away"
+
+        # Preserve identifiers and other non-empty metadata sent by the edge.
         for field in (
             "object_id",
             "track_id",
@@ -735,12 +649,18 @@ class ExistingObjectPredictor:
             value = partial_object.get(field)
             if value is not None and value != "":
                 prediction[field] = value
-        class_name = _first_text(partial_object, "class_name", "class")
-        if class_name:
+
+        class_name = self._first_value(
+            partial_object,
+            "class_name",
+            "class",
+        )
+        if self._has_text(class_name):
             prediction["class_name"] = class_name
-        confidence = _as_float(partial_object.get("confidence"))
-        if confidence is not None:
-            prediction["confidence"] = round(confidence, 6)
+
+        actual_confidence = self._as_float(partial_object.get("confidence"))
+        if actual_confidence is not None:
+            prediction["confidence"] = round(actual_confidence, 6)
 
         prediction["partial_descriptor_received"] = True
         prediction["prediction_reason"] = "partial_existing_object"
@@ -758,8 +678,11 @@ class ExistingObjectPredictor:
         ]
         return prediction
 
-    def process_packet(self, data: Dict) -> List[Dict]:
-        """Store actual data and return predictions for missing known tracks."""
+    def process_packet(self, data):
+        """
+        Record actual objects and, for a reduced packet, return predictions for
+        omitted existing objects at the packet's frame/time.
+        """
         metadata = data.get("metadata", {})
         camera_key = self._camera_key(metadata)
         frame_id = self._frame_id(metadata, camera_key)
@@ -767,20 +690,32 @@ class ExistingObjectPredictor:
         objects = data.get("objects", []) or []
 
         received_track_ids = set()
-        partial_objects = {}
+        partial_objects_by_track = {}
         for obj in objects:
             track_id = self._first_value(
-                obj, "track_id", "object_track_id", "object_id"
+                obj,
+                "track_id",
+                "object_track_id",
+                "object_id",
             )
-            if track_id is None:
-                continue
-            track_key = self._track_key(track_id)
-            received_track_ids.add(track_key)
-            missing = self._missing_prediction_fields(obj)
-            if missing and (camera_key, track_key) in self.track_histories:
-                partial_objects[track_key] = (obj, missing)
+            if track_id is not None:
+                track_key = self._track_key(track_id)
+                received_track_ids.add(track_key)
 
-        omitted_ids = self._first_value(
+                # Automatically fill empty properties when this track already
+                # exists in server history, even if the sender did not set a
+                # packet-level prediction flag.
+                missing_fields = self._missing_prediction_fields(obj)
+                if (
+                    missing_fields
+                    and (camera_key, track_key) in self.track_histories
+                ):
+                    partial_objects_by_track[track_key] = (
+                        obj,
+                        missing_fields,
+                    )
+
+        omitted_track_ids = self._first_value(
             metadata,
             "omitted_track_ids",
             "existing_track_ids",
@@ -792,75 +727,102 @@ class ExistingObjectPredictor:
                 "tracks_to_predict",
             ),
         )
-        omitted_keys = None
-        if isinstance(omitted_ids, (list, tuple, set)):
-            omitted_keys = {self._track_key(track_id) for track_id in omitted_ids}
+        omitted_track_keys = None
+        if isinstance(omitted_track_ids, (list, tuple, set)):
+            omitted_track_keys = {
+                self._track_key(track_id) for track_id in omitted_track_ids
+            }
 
         predictions = []
-        if self.prediction_requested(data) or partial_objects:
-            target_frame = _as_int(
-                metadata.get("prediction_target_frame_id"), frame_id
+        if self.prediction_requested(data) or partial_objects_by_track:
+            target_frame_id = self._as_int(
+                self._first_value(
+                    metadata,
+                    "prediction_target_frame_id",
+                    default=frame_id,
+                ),
+                frame_id,
             )
-            target_timestamp = timestamp + max(0, target_frame - frame_id) / self.fps
-            frame_width = _as_int(
-                self._first_value(metadata, "frame_width", "image_width"),
+            target_timestamp = timestamp + (
+                max(0, target_frame_id - frame_id) / self.fps
+            )
+
+            frame_width = self._as_int(
+                self._first_value(
+                    metadata,
+                    "frame_width",
+                    "image_width",
+                ),
                 self.default_frame_width,
             )
-            frame_height = _as_int(
-                self._first_value(metadata, "frame_height", "image_height"),
+            frame_height = self._as_int(
+                self._first_value(
+                    metadata,
+                    "frame_height",
+                    "image_height",
+                ),
                 self.default_frame_height,
             )
 
-            for (track_camera, track_key), history in list(
+            for (history_camera, track_key), history in list(
                 self.track_histories.items()
             ):
-                if track_camera != camera_key or not history:
+                if history_camera != camera_key or not history:
                     continue
-                partial_record = partial_objects.get(track_key)
+                partial_record = partial_objects_by_track.get(track_key)
                 if track_key in received_track_ids and partial_record is None:
                     continue
                 if (
-                    omitted_keys is not None
-                    and track_key not in omitted_keys
+                    omitted_track_keys is not None
+                    and track_key not in omitted_track_keys
                     and partial_record is None
                 ):
                     continue
 
                 prediction = self._predict_track(
-                    history,
-                    target_frame,
-                    target_timestamp,
-                    frame_width,
-                    frame_height,
+                    history=history,
+                    target_frame_id=target_frame_id,
+                    target_timestamp=target_timestamp,
+                    frame_width=frame_width,
+                    frame_height=frame_height,
                 )
-                if prediction is None:
-                    continue
-                if partial_record is not None:
-                    partial_object, missing_fields = partial_record
-                    prediction = self._merge_partial_descriptor(
-                        prediction,
-                        partial_object,
-                        missing_fields,
-                        history,
-                        target_timestamp,
-                    )
-                else:
-                    prediction["prediction_reason"] = "omitted_existing_object"
-                    prediction["predicted_fields"] = [
-                        "bbox",
-                        "distance_m",
-                        "bearing_deg",
-                        "direction",
-                        "speed_kmh",
-                    ]
-                predictions.append(prediction)
+                if prediction is not None:
+                    if partial_record is not None:
+                        partial_object, missing_fields = partial_record
+                        prediction = self._merge_partial_descriptor(
+                            prediction=prediction,
+                            partial_object=partial_object,
+                            missing_fields=missing_fields,
+                            history=history,
+                            target_timestamp=target_timestamp,
+                        )
+                    else:
+                        prediction["prediction_reason"] = (
+                            "omitted_existing_object"
+                        )
+                        prediction["predicted_fields"] = [
+                            "bbox",
+                            "distance_m",
+                            "bearing_deg",
+                            "direction",
+                            "speed_kmh",
+                        ]
+                    predictions.append(prediction)
 
-        # Store only actual received observations; never store predictions.
-        self._observe_actual_objects(camera_key, frame_id, timestamp, objects)
+        # Add only actual received objects after prediction. This also lets a
+        # newly received object become an existing track in the next frame.
+        self._observe_actual_objects(
+            camera_key=camera_key,
+            frame_id=frame_id,
+            timestamp=timestamp,
+            objects=objects,
+        )
         self.latest_frame_by_camera[camera_key] = max(
-            frame_id, self.latest_frame_by_camera.get(camera_key, frame_id)
+            frame_id,
+            self.latest_frame_by_camera.get(camera_key, frame_id),
         )
 
+        # Remove histories that are far outside the prediction horizon.
         stale_before = frame_id - max(self.max_missed_frames * 5, 25)
         for key, history in list(self.track_histories.items()):
             if (
@@ -869,45 +831,1478 @@ class ExistingObjectPredictor:
                 and history[-1]["frame_id"] < stale_before
             ):
                 del self.track_histories[key]
+
         return predictions
 
 
-def _as_int(value, default=None):
+
+
+
+
+class TSNReceiver:
+    def __init__(self, listen_ip="0.0.0.0", port=12345, buffer_size=65535):
+        self.listen_ip = listen_ip
+        self.port = port
+        self.buffer_size = buffer_size
+        self.chunk_buffers = {}
+
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind((self.listen_ip, self.port))
+
+        print(f"Listening on {self.listen_ip}:{self.port}")
+
+    def get_data(self) -> Optional[Dict]:
+        packet, addr = self.sock.recvfrom(self.buffer_size)
+
+        if len(packet) < HEADER_SIZE:
+            print("Packet too small, ignoring")
+            return None
+
+        packet_type, message_id, total_chunks, chunk_index = struct.unpack(
+            HEADER_FORMAT,
+            packet[:HEADER_SIZE],
+        )
+
+        payload_bytes = packet[HEADER_SIZE:]
+
+        if packet_type == SINGLE_PACKET_TYPE:
+            raw = zlib.decompress(payload_bytes)
+            data = json.loads(raw.decode("utf-8"))
+            data["_source_addr"] = addr[0]
+            return data
+
+        if packet_type == CHUNK_PACKET_TYPE:
+            return self._handle_chunk(
+                message_id=message_id,
+                total_chunks=total_chunks,
+                chunk_index=chunk_index,
+                payload_bytes=payload_bytes,
+                addr=addr,
+            )
+
+        print(f"Unknown packet type: {packet_type}")
+        return None
+
+    def _handle_chunk(self, message_id, total_chunks, chunk_index, payload_bytes, addr):
+        if message_id not in self.chunk_buffers:
+            self.chunk_buffers[message_id] = {
+                "total_chunks": total_chunks,
+                "chunks": {},
+                "source_addr": addr[0],
+                "start_time": time.time(),
+            }
+
+        self.chunk_buffers[message_id]["chunks"][chunk_index] = payload_bytes
+
+        received = len(self.chunk_buffers[message_id]["chunks"])
+        print(f"[CHUNK RX] message_id={message_id}, chunk={chunk_index + 1}/{total_chunks}")
+
+        if received < total_chunks:
+            return None
+
+        chunks = self.chunk_buffers[message_id]["chunks"]
+        compressed = b"".join(chunks[i] for i in range(total_chunks))
+
+        del self.chunk_buffers[message_id]
+
+        raw = zlib.decompress(compressed)
+        data = json.loads(raw.decode("utf-8"))
+        data["_source_addr"] = addr[0]
+
+        print(f"[CHUNK COMPLETE] message_id={message_id}, type={data.get('type')}")
+        return data
+
+    def close(self):
+        self.sock.close()
+        
+        
+        
+        
+        
+
+class TransReIDProcessor:
+    """Proper TransReID model for feature extraction"""
+
+    def __init__(
+        self,
+        model_path="/home/jdg24001/Documents/github/Secure-Camera/weights-models/jx_vit_base_p16_224-80ecf9dd.pth",
+        config_path="/home/jdg24001/Documents/github/Secure-Camera/weights-models/vit_transreid_stride.yml",
+    ):
+        
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f" Device selected: {self.device}")
+        if torch.cuda.is_available():
+            print(f"GPU: {torch.cuda.get_device_name(0)}")
+            print(
+                f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB"
+            )
+        else:
+            print("No GPU available, using CPU")
+        self.load_model(model_path, config_path)
+
+    def load_model(self, model_path=None, config_file=None):
+        """Load TransReID model with multiple fallback strategies"""
+
+        # Set default model path
+
+        
+        if model_path is None:
+            model_path = "/home/jdg24001/Documents/github/Secure-Camera/weights-models/jx_vit_base_p16_224-80ecf9dd.pth"
+
+        try:
+            print("Loading TransReID model...")
+
+            # Import TransReID config
+            from TransReID.config import cfg
+
+            # Configure the model
+            cfg.MODEL.NAME = "transformer"
+            cfg.MODEL.TRANSFORMER_TYPE = "vit_base_patch16_224_TransReID"
+            cfg.MODEL.SIE_CAMERA = False
+            cfg.MODEL.SIE_VIEW = False
+            cfg.MODEL.JPM = True
+            cfg.MODEL.PRETRAIN_CHOICE = "self"
+            cfg.MODEL.PRETRAIN_PATH = (
+                "/home/jdg24001/Documents/github/Secure-Camera/weights-models/jx_vit_base_p16_224-80ecf9dd.pth"
+            )
+            cfg.TEST.WEIGHT = model_path
+            cfg.INPUT.SIZE_TEST = [256, 128]
+            cfg.INPUT.SIZE_TRAIN = [256, 128]
+            cfg.MODEL.DEVICE = self.device
+            cfg.freeze()
+
+            # Import and create model
+            from TransReID.model import make_model
+
+            # Create model without SIE (no camera/view settings needed)
+            self.model = make_model(cfg, num_class=751, camera_num=0, view_num=0)
+
+            # Try to load weights
+            if os.path.exists(model_path):
+                try:
+                    self.model.load_param(model_path)
+                    print(f" Successfully loaded weights from {model_path}")
+                except Exception as e:
+                    print(f"Standard loading failed: {e}")
+                    print("Trying partial weight loading...")
+                    self._load_weights_partially(model_path)
+                    print(" Partially loaded weights")
+            else:
+                print(f"Warning: Weights not found at {model_path}")
+
+            self.model.to(self.device)
+            self.model.eval()
+            print(f" TransReID model loaded successfully on {self.device}")
+
+        except Exception as e:
+            print(f" Error loading TransReID model: {e}")
+            import traceback
+
+            traceback.print_exc()
+            print("Falling back to feature passthrough mode")
+            self.model = None
+
+    def _load_weights_partially(self, model_path):
+        """Load weights partially, skipping incompatible layers"""
+        import torch
+
+        try:
+            param_dict = torch.load(model_path, map_location="cpu")
+            model_dict = self.model.state_dict()
+
+            # Filter out incompatible parameters
+            compatible_dict = {}
+            incompatible_keys = []
+
+            for key in param_dict:
+                clean_key = key.replace("module.", "")
+                if clean_key in model_dict:
+                    if param_dict[key].shape == model_dict[clean_key].shape:
+                        compatible_dict[clean_key] = param_dict[key]
+                    else:
+                        incompatible_keys.append(f"{clean_key} (shape mismatch)")
+                else:
+                    incompatible_keys.append(f"{clean_key} (missing in model)")
+
+            # Load compatible parameters
+            model_dict.update(compatible_dict)
+            self.model.load_state_dict(model_dict, strict=False)
+
+            print(f"Loaded {len(compatible_dict)}/{len(param_dict)} parameters")
+            if incompatible_keys:
+                print(
+                    f"Skipped incompatible keys: {incompatible_keys[:5]}..."
+                )  # Show first 5
+
+        except Exception as e:
+            print(f"Partial loading also failed: {e}")
+            raise e
+
+    def extract_features(self, person_images):
+        """Extract ReID features from person images"""
+
+        # if self.model is None:
+        #     # Fallback: just normalize input features
+        #     print(
+        #         "TransReID model failed to load for feature extraction. "
+        #         "Falling back to feature passthrough mode"
+        #     )
+        #     return torch.nn.functional.normalize(person_images, dim=1, p=2)
+        if self.model is None:
+            print(
+                "TransReID model failed to load for feature extraction. "
+                "Using fallback 384-dim embedding"
+            )
+
+            if person_images.dim() == 3:
+                person_images = person_images.unsqueeze(0)
+
+            flat = person_images.flatten(start_dim=1)
+
+            if flat.shape[1] >= 384:
+                features = flat[:, :384]
+            else:
+                pad_size = 384 - flat.shape[1]
+                features = torch.nn.functional.pad(flat, (0, pad_size))
+
+            return torch.nn.functional.normalize(features, dim=1, p=2)
+
+        try:
+            """Context-manager that disables gradient calculation.
+            Disabling gradient calculation is useful for inference, when you are sure
+            that you will not call Tensor.backward(). It will reduce memory consumption for computations that would otherwise have requires_grad=True.
+            """
+            with torch.no_grad():
+                print(f"Input tensor shape: {person_images.shape}")
+                # print(f"Input tensor dtype: {person_images.dtype}")
+                print(f"Input tensor device: {person_images.device}")
+
+                person_images = person_images.to(self.device)
+                print(f"🚀 Running inference on: {self.device}")
+                if self.device == "cuda":
+                    print(
+                        f"⚡ GPU Memory used: {torch.cuda.memory_allocated() / 1024**2:.1f} MB"
+                    )
+
+                # Add input validation
+                if person_images.dim() != 4:
+                    raise ValueError(f"Expected 4D tensor, got {person_images.dim()}D")
+                if person_images.size(1) != 3:
+                    raise ValueError(
+                        f"Expected 3 channels, got {person_images.size(1)}"
+                    )
+                if person_images.size(2) != 256 or person_images.size(3) != 128:
+                    raise ValueError(
+                        f"Expected 256x128 images, got {person_images.size(2)}x{person_images.size(3)}"
+                    )
+
+                # Calling the model - Step 7
+                # print("Calling TransReID model...")
+                features = self.model(person_images)
+                # print(f"Model output shape: {features.shape}")
+                if self.device == "cuda":
+                    print(
+                        f"📊 GPU Memory after inference: {torch.cuda.memory_allocated() / 1024**2:.1f} MB"
+                    )
+                return features.cpu()
+        except Exception as e:
+            print(f"Error in feature extraction: {e}")
+            import traceback
+
+            traceback.print_exc()
+            # print("Falling back to feature passthrough mode")
+            # return torch.nn.functional.normalize(person_images, dim=1, p=2)
+            print("Using fallback 384-dim embedding")
+
+            if person_images.dim() == 3:
+                person_images = person_images.unsqueeze(0)
+
+            flat = person_images.flatten(start_dim=1)
+
+            if flat.shape[1] >= 384:
+                features = flat[:, :384]
+            else:
+                pad_size = 384 - flat.shape[1]
+                features = torch.nn.functional.pad(flat, (0, pad_size))
+
+            return torch.nn.functional.normalize(features.cpu(), dim=1, p=2)
+
+
+class WeaviateReIDManager:
+    """Enhanced Weaviate manager for complete ReID operations"""
+
+    def __init__(
+        self,
+        weaviate_url: str = "http://localhost:8080",
+        collection_name: str = "reid_collection",
+        similarity_threshold: float = 0.7,
+        max_gallery_size: int = 10000,
+        store_crops: bool = False,
+    ):
+        self.vector_store = ReIDVectorStore(weaviate_url, collection_name)
+        self.similarity_threshold = similarity_threshold
+        self.max_gallery_size = max_gallery_size
+        self.person_id_counter = 0
+        self.store_crops = store_crops
+
+        # Initialize MongoDB Storage - Encrypted
+        self.mongo_storage = SecureReIDStorage()
+        print("🔒 MongoDB storage initialized for gallery data")
+
+    def process_and_identify(
+        self, objects_data: Dict, reid_features: torch.Tensor
+    ) -> List[Dict]:
+        """
+        Core ReID functionality:
+        1. Store new features in Weaviate
+        2. Find similar existing persons
+        3. Assign person IDs
+        4. Update person profiles
+        """
+        results = []
+        print(f"\nTotal number of received objects: {len(objects_data["objects"])}\n")
+
+        for i, obj in enumerate(objects_data["objects"]):
+            person_feature = reid_features[i : i + 1]  # Shape: [1, feature_dim]
+
+            # 1. Search for similar persons in database
+            similar_persons = self.find_similar_persons(
+                person_feature,
+                obj.get("class_name", "person"),
+                objects_data["metadata"]["camera_id"],
+            )
+
+            # 2. Determine person identity
+            person_identity = self.determine_identity(
+                similar_persons, person_feature, obj
+            )
+
+            print(
+                f"[IDENTITY] object_id={obj.get('object_id', i)} "
+                f"person_id={person_identity['person_id']} "
+                f"is_new={person_identity['is_new']} "
+                f"confidence={person_identity['confidence']:.3f} "
+                f"similar_matches={len(similar_persons)}"
+            )
+
+            # 3. Store/Update in Weaviate
+            store_crops = getattr(self, "store_crops", False)
+            print(f"🔧 store_crops={store_crops} for object {i}")
+            if store_crops:
+                print(f"🖼️  Storing with image crops enabled for object {i}")
+            storage_result = self.store_person_data(
+                objects_data, obj, person_feature, person_identity, i, store_crops
+            )
+
+            # 4. Compile result
+            result = {
+                "detection_id": obj.get("object_id", i),
+                "person_id": person_identity["person_id"],
+                "confidence": person_identity["confidence"],
+                "is_new_person": person_identity["is_new"],
+                "similar_detections": len(similar_persons),
+                "bbox": obj.get("bbox", [0, 0, 0, 0]),
+                "camera_id": objects_data["metadata"]["camera_id"],
+                "frame_id": objects_data["metadata"]["frame_id"],
+                "timestamp": objects_data["metadata"]["timestamp"],
+                "cross_camera_matches": person_identity.get("cross_camera_matches", []),
+                "weaviate_id": storage_result[0]
+                if storage_result and len(storage_result) > 0
+                else None,
+            }
+
+            results.append(result)
+
+        return results
+
+    def find_similar_persons(
+        self, query_feature: torch.Tensor, class_filter: str, current_camera: str
+    ) -> List[Dict]:
+        """Find similar persons in the vector database"""
+        try:
+            # Search in Weaviate for similar embeddings
+            similar_results = self.vector_store.search_similar(
+                query_feature,
+                top_k=20,  # Get more results for better matching
+                class_filter=class_filter,
+                confidence_threshold=0.3,  # Lower threshold for initial search
+                distance_threshold=2.0,  # Euclidean distance threshold
+            )
+
+            # Filter by similarity threshold and add distance scores
+            filtered_results = []
+            for result in similar_results:
+                # Calculate actual similarity score (you might need to implement this)
+                similarity_score = self.calculate_similarity(query_feature, result)
+
+                if similarity_score >= self.similarity_threshold:
+                    result["similarity_score"] = similarity_score
+                    result["is_cross_camera"] = result["camera_id"] != current_camera
+                    filtered_results.append(result)
+
+            print(f"done with find_similar_persons, and found: {len(filtered_results)}")
+            return filtered_results
+
+        except Exception as e:
+            print(f"Error in similarity search: {e}")
+            return []
+
+    def determine_identity(
+        self, similar_persons: List[Dict], person_feature: torch.Tensor, obj: Dict
+    ) -> Dict:
+        """Determine if this is a new person or matches existing identity"""
+
+        if not similar_persons:
+            # New person - assign new ID
+            self.person_id_counter += 1
+            return {
+                "person_id": f"person_{self.person_id_counter:06d}",
+                "confidence": 1.0,
+                "is_new": True,
+                "matched_detection": None,
+            }
+
+        # Find best match
+        best_match = max(similar_persons, key=lambda x: x.get("similarity_score", 0))
+
+        if best_match["similarity_score"] >= self.similarity_threshold:
+            # Existing person identified
+            cross_camera_matches = [
+                p
+                for p in similar_persons
+                if p.get("is_cross_camera", False)
+                and p.get("similarity_score", 0) >= self.similarity_threshold
+            ]
+
+            return {
+                "person_id": best_match.get(
+                    "person_id", f"unknown_{best_match.get('object_id')}"
+                ),
+                "confidence": best_match["similarity_score"],
+                "is_new": False,
+                "matched_detection": best_match,
+                "cross_camera_matches": cross_camera_matches[
+                    :5
+                ],  # Top 5 cross-camera matches
+            }
+
+            # object_id = best_match.get("person_id")
+
+            # if object_id is None or object_id == "":
+            #     self.person_id_counter += 1
+            #     matched_person_id = f"person_{self.person_id_counter:06d}"
+            # else:
+            #     matched_person_id = f"unknown_{object_id}"
+                
+
+            # return {
+            #     "person_id": matched_person_id,
+            #     "confidence": best_match["similarity_score"],
+            #     "is_new": False,
+            #     "matched_detection": best_match,
+            #     "cross_camera_matches": cross_camera_matches[:5],
+            # }
+
+
+        else:
+            # No confident match - new person
+            print("new person detected!")
+            self.person_id_counter += 1
+            return {
+                "person_id": f"person_{self.person_id_counter:06d}",
+                "confidence": 0.6,  # Lower confidence for borderline cases
+                "is_new": True,
+                "matched_detection": None,
+            }
+        print("done with identity detemination")
+
+    def store_person_data(
+        self,
+        objects_data: Dict,
+        obj: Dict,
+        person_feature: torch.Tensor,
+        person_identity: Dict,
+        index: int,
+        store_crops: bool = False,
+    ):
+        """Store person data with assigned identity in Weaviate"""
+        try:
+            # Use processed_image - it's a normalized tensor that needs unnormalization
+            person_crop = None
+            if "processed_image" in obj:
+                img_list = obj["processed_image"]
+
+                print(f"📷 Raw tensor shape: {np.array(img_list).shape}")
+
+                # Convert JSON list -> torch tensor
+                tensor = torch.tensor(img_list)  # shape: (3, H, W)
+
+                # Undo ImageNet normalization
+                mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+                std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+
+                unnormalized = tensor * std + mean  # reverse normalization
+                unnormalized = unnormalized.clamp(0, 1)
+
+                # print(
+                #     f"🔄 Unnormalized tensor range: [{unnormalized.min():.3f}, {unnormalized.max():.3f}]"
+                # )
+
+                # Convert to PIL image
+                to_pil = T.ToPILImage()
+                pil_image = to_pil(unnormalized)
+
+                # Convert PIL to numpy array for base64 encoding
+                person_crop_array = np.array(pil_image)
+
+                # convert to bytes (PNG format for storage)
+                import io
+
+                from PIL import Image
+
+                img_buffer = io.BytesIO()
+                pil_image.save(img_buffer, format="PNG")
+                person_crop_bytes = img_buffer.getvalue()
+
+            if person_identity.get("person_id") is None:
+                self.person_id_counter += 1
+                person_identity["person_id"] = f"person_{self.person_id_counter:06d}"
+
+            mongo_result = ReIDResult(
+                object_id=str(obj.get("object_id", f"obj_{index}")),
+                class_name=obj.get("class_name", "unknown"),
+                confidence=float(obj.get("confidence", 0.0)),
+                bbox=obj.get("bbox", [0, 0, 0, 0]),
+                camera_id=str(objects_data["metadata"].get("camera_id", "unknown")),
+                camera_location=str(objects_data["metadata"].get("camera_location", "unknown")),
+                frame_id=int(objects_data["metadata"].get("frame_id", 0)),
+                # timestamp=float(objects_data["metadata"].get("timestamp", 0)),
+                timestamp=parse_timestamp(objects_data["metadata"].get("timestamp")),
+                embedding_method="TransReID",
+                reid_confidence=person_identity["confidence"],
+                person_id=person_identity["person_id"],
+                is_new_person=person_identity["is_new"],
+                image=person_crop_bytes
+                if person_crop_bytes
+                else b"",  # Raw image bytes
+            )
+
+            # store data in mongo
+            embedding_vector = person_feature.cpu().numpy()
+            self.mongo_storage.store_reid_result(embedding_vector, mongo_result)
+            print(
+                f"Stored encrypted data in mongo for person {person_identity['person_id']} "
+            )
+
+            # Process detection to include image crop if available and enabled
+            # Store the person crop directly as base64 if available
+            # enhanced_obj = obj.copy()
+            # if store_crops and person_crop is not None:
+            #     try:
+            #         base64_crop = encode_image_to_base64(person_crop)
+            #         if base64_crop:
+            #             enhanced_obj["image_crop_base64"] = base64_crop
+            #             print(f" Encoded person crop to base64 for object {index}")
+            #         else:
+            #             print(f"⚠️ Failed to encode person crop for object {index}")
+            #     except Exception as e:
+            #         print(f" Error encoding person crop for object {index}: {e}")
+            # elif store_crops:
+            #     print(f"⚠️ No processed_image found for object {index}")
+
+            # Prepare data object with person identity to store in weaviate - minimal information
+            objects_data_with_person_id = {
+                "metadata": objects_data["metadata"],
+                "objects": [
+                    {
+                        "person_id": person_identity["person_id"],
+                        "reid_confidence": person_identity["confidence"],
+                        "is_new_person": person_identity["is_new"],
+                    }
+                ],
+            }
+
+            # Store in Weaviate with image crops if available
+            result = self.vector_store.store_embeddings(
+                objects_data_with_person_id, person_feature
+            )
+
+            return result if result else None
+
+        except Exception as e:
+            print(f"Error storing person data: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return None
+
+    def calculate_similarity(self, query_feature: torch.Tensor, result: Dict) -> float:
+        """Calculate similarity score between query and result"""
+        # This is a placeholder - you might need to implement proper similarity calculation
+        # based on the distance returned by Weaviate
+        try:
+            # Weaviate returns distance, convert to similarity (0-1 scale)
+            distance = result.get("_additional", {}).get("distance", 1.0)
+            similarity = max(
+                0, 1.0 - (distance / 2.0)
+            )  # Normalize distance to similarity
+            return similarity
+        except:
+            return 0.5  # Default similarity
+
+    # def get_person_history(self, person_id: str, limit: int = 10) -> List[Dict]:
+    #     """Get detection history for a specific person"""
+    #     try:
+    #         # Query Weaviate for all detections of this person
+    #         query_builder = (
+    #             self.vector_store.client.query.get(
+    #                 self.vector_store.collection_name,
+    #                 [
+    #                     "object_id",
+    #                     "camera_id",
+    #                     "frame_id",
+    #                     "timestamp",
+    #                     "bbox",
+    #                     "confidence",
+    #                 ],
+    #             )
+    #             .with_where(
+    #                 {
+    #                     "path": ["person_id"],
+    #                     "operator": "Equal",
+    #                     "valueString": person_id,
+    #                 }
+    #             )
+    #             .with_limit(limit)
+    #             .with_sort([{"path": ["timestamp"], "order": "desc"}])
+    #         )
+
+    #         results = query_builder.do()
+    #         return results["data"]["Get"][self.vector_store.collection_name]
+
+    #     except Exception as e:
+    #         print(f"Error getting person history: {e}")
+    #         return []
+    def get_person_history(self, person_id: str, limit: int = 10) -> List[Dict]:
+        try:
+            if person_id is None or person_id == "":
+                print("Cannot get history because person_id is None")
+                return []
+
+            from weaviate.classes.query import Filter
+
+            collection = self.vector_store.client.collections.get(
+                self.vector_store.collection_name
+            )
+
+            response = collection.query.fetch_objects(
+                filters=Filter.by_property("person_id").equal(person_id),
+                limit=limit,
+            )
+
+            history = []
+
+            for obj in response.objects:
+                item = dict(obj.properties)
+                item["weaviate_id"] = str(obj.uuid)
+                history.append(item)
+
+            return history
+
+        except Exception as e:
+            print(f"Error getting person history: {e}")
+            return []
+
+
+class C2Processor:
+    """Main C2 processor with complete Pose2ID and Weaviate integration"""
+
+    def __init__(self, args):
+        self.args = args
+
+        # Initialize components
+        self.receiver = TSNReceiver(args.listen_ip, args.port)
+
+        self.object_predictor = None
+        if not args.disable_object_prediction:
+            self.object_predictor = ExistingObjectPredictor(
+                fps=args.camera_fps,
+                history_size=args.prediction_history,
+                max_missed_frames=args.prediction_max_missed,
+                max_radial_speed_kmh=args.prediction_max_speed_kmh,
+                frame_width=args.prediction_frame_width,
+                frame_height=args.prediction_frame_height,
+            )
+            print(
+                "Existing-object prediction enabled "
+                f"(history={args.prediction_history}, "
+                f"max_missed={args.prediction_max_missed}, "
+                f"max_speed={args.prediction_max_speed_kmh:.1f} km/h)"
+            )
+        
+        self.transreid_processor = TransReIDProcessor(model_path=args.transreid_model_path)
+        self.weaviate_manager = WeaviateReIDManager(
+            args.weaviate_url,
+            "PersonReID",
+            similarity_threshold=args.similarity_threshold,
+            store_crops=getattr(args, "store_crops", False),
+        )
+
+        # Initialize results saver if saving is enabled
+        if args.save_results:
+            print("Results saver enabled - will save to 'results' folder")
+
+        self.person_transform = T.Compose(
+            [
+                T.ToPILImage(),
+                T.Resize((256, 128)),
+                T.ToTensor(),
+                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ]
+        )
+
+        print("TSN receiver with Weaviate ReID initialized")
+
+
+        # Runtime statistics... ... ... 
+
+        self.start_time = time.time()
+        self.frames_processed = 0
+        self.persons_detected = 0
+        self.new_persons = 0
+        self.existing_persons = 0
+        self.stats_interval = 15
+
+    def process_object_predictions(self, data: Dict) -> List[Dict]:
+        """
+        Update the server-side object history and predict existing objects that
+        the sender intentionally omitted from a reduced GCL-update packet.
+
+        Predictions are attached to ``predicted_existing_objects`` instead of
+        ``objects``. This is intentional: predicted records have no real image
+        crop and must not be passed to TransReID or stored as observations.
+        """
+        if self.object_predictor is None:
+            return []
+
+        predictions = self.object_predictor.process_packet(data)
+        data["predicted_existing_objects"] = predictions
+
+        if not predictions:
+            if self.object_predictor.prediction_requested(data):
+                print(
+                    "[PREDICTION] Reduced packet received, but no eligible "
+                    "existing tracks were found in server history"
+                )
+            return []
+
+        metadata = data.get("metadata", {})
+        frame_id = metadata.get("prediction_target_frame_id")
+        if frame_id is None:
+            frame_id = metadata.get("frame_id", "unknown")
+        camera_id = metadata.get("camera_id", "unknown")
+        camera_location = metadata.get("camera_location", "unknown")
+
+        print("\n" + "=" * 80)
+        print(
+            f"[SERVER PREDICTION] frame_id={frame_id} "
+            f"camera={camera_id} location={camera_location} "
+            f"predicted_existing_objects={len(predictions)}"
+        )
+
+        for index, obj in enumerate(predictions):
+            print(
+                f"  predicted object {index}: "
+                f"class={obj.get('class_name')} "
+                f"track_id={obj.get('track_id')} "
+                f"bbox={obj.get('bbox')} "
+                f"distance_m={obj.get('distance_m')} "
+                f"bearing_deg={obj.get('bearing_deg')} "
+                f"direction={obj.get('direction')} "
+                f"speed_kmh={obj.get('speed_kmh')} "
+                f"predicted_fields={obj.get('predicted_fields')} "
+                f"prediction_confidence={obj.get('prediction_confidence')} "
+                f"speed_outlier={obj.get('speed_outlier')}"
+            )
+        print("=" * 80)
+
+        if self.args.save_predictions:
+            self.save_predicted_objects(data, predictions)
+
+        return predictions
+
+    def save_predicted_objects(self, data: Dict, predictions: List[Dict]):
+        metadata = data.get("metadata", {})
+        camera_id = str(metadata.get("camera_id", "unknown"))
+        camera_location = str(metadata.get("camera_location", "unknown"))
+        frame_id = metadata.get(
+            "prediction_target_frame_id",
+            metadata.get("frame_id", "unknown"),
+        )
+
+        safe_camera = "".join(
+            character if character.isalnum() or character in "-_" else "_"
+            for character in f"{camera_location}_{camera_id}"
+        )
+        os.makedirs(self.args.prediction_output_dir, exist_ok=True)
+        filename = os.path.join(
+            self.args.prediction_output_dir,
+            f"{safe_camera}_frame_{frame_id}_predicted.json",
+        )
+
+        output = {
+            "type": "predicted_existing_objects",
+            "metadata": {
+                "camera_id": camera_id,
+                "camera_location": camera_location,
+                "frame_id": frame_id,
+                "generated_at": datetime.now().isoformat(),
+                "actual_payload_pending": True,
+            },
+            "objects": predictions,
+        }
+
+        try:
+            with open(filename, "w") as prediction_file:
+                json.dump(output, prediction_file, indent=2, default=str)
+            print(f"[PREDICTION SAVED] {filename}")
+        except Exception as e:
+            print(f"Could not save object predictions: {e}")
+
+
+    def print_statistics(self):
+        runtime = time.time() - self.start_time
+
+        if runtime > 0:
+            fps = self.frames_processed / runtime
+        else:
+            fps = 0.0
+
+        print("\n" + "-" * 80)
+        print(f"STATISTICS (Runtime: {runtime:.1f}s):")
+        print(f"  Frames processed: {self.frames_processed} ({fps:.2f} FPS)")
+        print(f"  Persons detected: {self.persons_detected}")
+        print(f"  New persons: {self.new_persons}")
+        print(f"  Existing persons: {self.existing_persons}")
+        print("-" * 80)
+
+        
+    def update_statistics(self, reid_results: List[Dict]):
+        """
+        Update runtime statistics after processing one detected_objects packet.
+        """
+
+        self.frames_processed += 1
+
+        persons_in_frame = len(reid_results)
+        self.persons_detected += persons_in_frame
+
+        new_in_frame = sum(1 for r in reid_results if r.get("is_new_person", False))
+        existing_in_frame = persons_in_frame - new_in_frame
+
+        self.new_persons += new_in_frame
+        self.existing_persons += existing_in_frame
+
+        if self.frames_processed % self.stats_interval == 0:
+            self.print_statistics()
+
+
+
+
+
+
+
+    def crop_b64_to_processed_image(self, crop_b64: str) -> Optional[List]:
+        try:
+            crop_bytes = base64.b64decode(crop_b64)
+            arr = np.frombuffer(crop_bytes, dtype=np.uint8)
+            crop_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if crop_bgr is None:
+                return None
+
+            crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+            tensor = self.person_transform(crop_rgb)
+            return tensor.tolist()
+
+        except Exception as e:
+            print(f"Failed to decode crop_jpg_b64: {e}")
+            return None
+
+    def normalize_incoming_data(self, data: Dict) -> Dict:
+        normalized_objects = []
+
+        for i, obj in enumerate(data.get("objects", [])):
+            new_obj = dict(obj)
+
+            if "processed_image" not in new_obj and "crop_jpg_b64" in new_obj:
+                processed = self.crop_b64_to_processed_image(new_obj["crop_jpg_b64"])
+                if processed is not None:
+                    new_obj["processed_image"] = processed
+
+            if "object_id" not in new_obj:
+                new_obj["object_id"] = i
+
+            normalized_objects.append(new_obj)
+
+        data["objects"] = normalized_objects
+        return data
+    
+    def print_person_history(self, person_id: str, limit: int = 50):
+        history = self.weaviate_manager.get_person_history(person_id, limit=limit)
+
+        if not history:
+            print(f"No history found for {person_id}")
+            return
+        
+        history = sorted(
+            history,
+            key=lambda x: str(x.get("timestamp", "")),
+            reverse=True,
+        )
+
+
+        from collections import Counter
+        camera_counts = Counter(item.get("camera_id") for item in history)
+
+        print(f"\nHistory for {person_id}:")
+        print("-" * 80)
+
+        print("Camera summary:")
+        for cam, count in camera_counts.items():
+            print(f"  {cam}: {count} records")
+
+        print("-" * 80)
+
+        for item in history:
+            print(
+                f"person_id={item.get('person_id')} "
+                f"camera={item.get('camera_id')} "
+                f"location={item.get('camera_location')} "
+                f"frame={item.get('frame_id')} "
+                f"time={item.get('timestamp')} "
+            )
+
+        print("-" * 80)
+
+
+    def process_detection(self, data: Dict) -> List[Dict]:
+
+        
+        """
+        
+        
+        Complete detection processing pipeline
+        
+        
+        """
+        try:
+            data = self.normalize_incoming_data(data)
+
+            frame_id = data["metadata"].get("frame_id", "unknown")
+            camera_id = data["metadata"].get("camera_id", "unknown")
+            camera_location = data["metadata"].get("camera_location", "unknown")
+            print(f"Processing frame {frame_id} from camera {camera_id} at location {camera_location}")
+            valid_objects = [
+                obj for obj in data.get("objects", [])
+                if "processed_image" in obj and obj.get("class_name") == "person"
+            ]
+
+            if not valid_objects:
+                print("No valid person objects with processed_image found")
+                return []
+
+            data["objects"] = valid_objects
+            
+            print(f"the number of valid objects: {len(valid_objects)}")
+
+            # processed_images_count = 0
+            # for i, obj in enumerate(data.get("objects", [])):
+            #     if "processed_image" in obj:
+            #         processed_shape = np.array(obj["processed_image"]).shape
+            #         print(f"📷 Object {i}: raw image shape={processed_shape}")
+            #         processed_images_count += 1
+
+            # if processed_images_count == 0:
+            #     print("No raw image data found in any objects!")
+            # else:
+            #     print(f"Found {processed_images_count} objects with raw image data")
+
+            # 1. Load trained ReID Model (TransReID, Resnet50, etc..)
+            # We already have the model loaded in the self.transreid_processor
+
+            # 1. Convert objects to tensor (Step 5)
+            raw_features = objects_to_tensor(data["objects"])
+            print(f"Raw features shape: {raw_features.shape}")
+
+            # 2. Extract proper ReID features using TransReID
+            # (step 6)
+            reid_features = self.transreid_processor.extract_features(raw_features)
+            print(f"ReID features shape: {reid_features.shape}")
+
+            # if reid_features.dim() > 2:
+            #     print(f"Fixing invalid ReID feature shape: {reid_features.shape}")
+
+            #     reid_features = reid_features.flatten(start_dim=1)
+
+            #     if reid_features.shape[1] >= 384:
+            #         reid_features = reid_features[:, :384]
+            #     else:
+            #         pad_size = 384 - reid_features.shape[1]
+            #         reid_features = torch.nn.functional.pad(reid_features, (0, pad_size))
+
+            #     print(f"Fixed ReID features shape: {reid_features.shape}")
+            
+            # FIX: make feature vector compatible with current Weaviate index dimension = 384
+            if reid_features.dim() > 2:
+                print(f"Flattening invalid ReID feature shape: {reid_features.shape}")
+                reid_features = reid_features.flatten(start_dim=1)
+
+            # if reid_features.shape[1] > 384:
+            #     print(f"Truncating ReID feature from {reid_features.shape[1]} to 384")
+            #     reid_features = reid_features[:, :384]
+
+            # elif reid_features.shape[1] < 384:
+            #     print(f"Padding ReID feature from {reid_features.shape[1]} to 384")
+            #     pad_size = 384 - reid_features.shape[1]
+            #     reid_features = torch.nn.functional.pad(reid_features, (0, pad_size))
+
+            print(f"Fixed ReID features shape: {reid_features.shape}")
+
+
+
+
+            # NOTE: We don't need to use Pose2ID's NFC since we can use weaviate's functionality for finding neighbors for current object
+
+            # 3. Final normalization
+            reid_features = torch.nn.functional.normalize(reid_features, dim=1, p=2)
+
+            # 4. Process through Weaviate ReID system
+            reid_results = self.weaviate_manager.process_and_identify(
+                data, reid_features
+            )
+
+            # 5. Display results
+            self.display_results(reid_results)
+
+            # shows person history
+
+            for result in reid_results:
+                self.print_person_history(result["person_id"])
+                
+
+            # 6. Save results if enabled
+            if self.args.save_results:
+                self.save_simple_results(data, reid_results)
+
+            return reid_results
+
+        except Exception as e:
+            print(f"Error processing detection: {e}")
+            return []
+
+    def display_results(self, results: List[Dict]):
+        """Display ReID results"""
+        print(f"\nReID Results ({len(results)} persons detected):")
+        print("-" * 80)
+
+        for result in results:
+            status = "NEW" if result["is_new_person"] else "EXISTING"
+            cross_cam = (
+                f", {len(result.get('cross_camera_matches', []))} cross-camera"
+                if result.get("cross_camera_matches")
+                else ""
+            )
+
+            print(
+                f"{status} | ID: {result['person_id']} | "
+                f"Conf: {result['confidence']:.3f} | "
+                f"Camera: {result['camera_id']} | "
+                f"Similar: {result['similar_detections']}{cross_cam}"
+            )
+
+        print("-" * 80)
+
+    def log_rx(self, data: Dict, status: str = "received"):
+        metadata = data.get("metadata", {})
+
+        payload_type = data.get("type") or metadata.get("payload_type", "unknown")
+        frame_id = metadata.get("frame_id", "NA")
+        camera_id = metadata.get("camera_id", "NA")
+        camera_location = metadata.get("camera_location", "unknown")
+        vlan_id = metadata.get("vlan_id", "NA")
+        vlan_interface = metadata.get("vlan_interface", "NA")
+        source_addr = data.get("_source_addr", "NA")
+        num_objects = len(data.get("objects", [])) if "objects" in data else 0
+
+        print(
+            f"[RX] status={status} "
+            f"type={payload_type} "
+            f"frame_id={frame_id} "
+            f"camera={camera_id} "
+            f"location={camera_location} "
+            f"objects={num_objects} "
+            f"vlan={vlan_id} "
+            f"iface={vlan_interface} "
+            f"src={source_addr}"
+        )
+
+    def handle_raw_frame(self, data: Dict):
+        try:
+            metadata = data.get("metadata", {})
+            frame_id = metadata.get("frame_id", "unknown")
+            camera_id = metadata.get("camera_id", "unknown")
+            camera_location = metadata.get("camera_location", "unknown")
+            frame_b64 = data.get("frame_jpg_b64")
+            if not frame_b64:
+                print(f"Raw frame packet missing frame_jpg_b64, frame_id={frame_id}")
+                return
+
+            frame_bytes = base64.b64decode(frame_b64)
+            arr = np.frombuffer(frame_bytes, dtype=np.uint8)
+            frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+            if frame is None:
+                print(f"Could not decode raw frame, frame_id={frame_id}")
+                return
+
+            doc = {
+                "frame_id": frame_id,
+                "camera_id": camera_id,
+                "camera_location": camera_location,
+                "timestamp": metadata.get("timestamp"),
+                "image_format": "jpg",
+                "image_bytes": frame_bytes,
+            }
+            
+            try:
+                mongo_id = self.weaviate_manager.mongo_storage.store_raw_frame_doc(doc)
+            except Exception as e:
+                print(f"Error storing raw frame doc in MongoDB: {e}")
+                mongo_id = None
+    
+    
+            save_dir = "received_raw_frames"
+            os.makedirs(save_dir, exist_ok=True)
+
+            filename = os.path.join(
+                save_dir,
+                f"{camera_location}_{camera_id}_frame_{frame_id}.jpg",
+            )
+
+            cv2.imwrite(filename, frame)
+
+            # print(
+            #     f"[RAW FRAME RX] frame_id={frame_id}, "
+            #     f"camera={camera_id}, saved={filename}, "
+            #     f"source={data.get('_source_addr')}"
+            # )
+            self.log_rx(data, status=f"raw_frame_saved saved={filename}")
+
+        except Exception as e:
+            print(f"Error handling raw frame: {e}")
+
+    def run(self):
+
+        print("Starting continuous processing...")
+
+        while True:
+            try:
+                data = self.receiver.get_data()
+                
+                if data is None:
+                    continue
+                
+                payload_type = data.get("type") or data.get("metadata", {}).get("payload_type")
+
+                if payload_type == "raw_frame":
+                    # self.log_rx(data, status="raw_frame_received")
+                    self.handle_raw_frame(data)
+                    continue
+
+                if payload_type == "detected_objects":
+                    # This must run before process_detection(), because that
+                    # method filters the packet down to person crops for ReID.
+                    predictions = self.process_object_predictions(data)
+
+                    if not data.get("objects"):
+                        status = "empty_object_packet"
+                        if predictions:
+                            status += f" predicted_existing={len(predictions)}"
+                        self.log_rx(data, status=status)
+                        continue
+
+                    status = "object_packet_received"
+                    if predictions:
+                        status += f" predicted_existing={len(predictions)}"
+                    self.log_rx(data, status=status)
+                    
+                    
+                    results = self.process_detection(data)
+
+                    # Update runtime statistics
+                    self.update_statistics(results)
+
+
+                    # Optional: Save results summary
+                    if results and self.args.save_results:
+                        self.save_results_summary(results)
+                    continue
+                
+                self.log_rx(data, status="unknown_payload")
+
+
+            except KeyboardInterrupt:
+                print("\nStopping C2 processor...")
+                break
+            except Exception as e:
+                print(f"Unexpected error: {e}")
+                continue
+
+    def save_results_summary(self, results: List[Dict]):
+        """Save processing results for analysis"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"reid_results_{timestamp}.json"
+
+        try:
+            with open(filename, "w") as f:
+                json.dump(results, f, indent=2, default=str)
+            print(f"Results saved to {filename}")
+        except Exception as e:
+            print(f"Error saving results: {e}")
+
+    def save_simple_results(self, data: Dict, reid_results: List[Dict]):
+        """Save results using simple file operations - one folder per person"""
+        try:
+            # Extract metadata
+            frame_id = str(data["metadata"].get("frame_id", "unknown"))
+            camera_id = str(data["metadata"].get("camera_id", "unknown"))
+
+            # Process each person separately
+            for result in reid_results:
+                person_id = result.get("person_id", "unknown")
+                detection_id = result.get("detection_id")
+
+                print(f"\n🧑 Processing person {person_id} (detection {detection_id})")
+
+                # Find the corresponding object in data
+                person_obj = None
+                for obj in data.get("objects", []):
+                    if str(obj.get("object_id", "")) == str(detection_id):
+                        person_obj = obj
+                        break
+
+                if person_obj is None:
+                    print(f"⚠️ Could not find object data for detection {detection_id}")
+                    continue
+
+                # Get the person's original image
+                original_image = None
+                if "processed_image" in person_obj:
+                    img_list = person_obj["processed_image"]
+
+                    # Convert JSON list -> torch tensor
+                    tensor = torch.tensor(img_list)  # shape: (3, H, W)
+
+                    # Undo ImageNet normalization
+                    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+                    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+
+                    unnormalized = tensor * std + mean
+                    unnormalized = unnormalized.clamp(0, 1)
+
+                    # Convert to PIL then numpy
+                    to_pil = T.ToPILImage()
+                    pil_image = to_pil(unnormalized)
+                    processed = np.array(pil_image)
+
+                    # Convert RGB to BGR for OpenCV
+                    if len(processed.shape) == 3 and processed.shape[2] == 3:
+                        original_image = cv2.cvtColor(processed, cv2.COLOR_RGB2BGR)
+                    else:
+                        original_image = processed
+
+                    print(f"📷 Extracted original image for person {person_id}")
+                else:
+                    print(f"⚠️ No processed_image found for person {person_id}")
+                    continue
+
+                # Get similar images for this person
+                similar_results = []
+                if result.get("similar_detections", 0) > 0:
+                    try:
+                        # Extract features and search for similar
+                        obj_tensor = objects_to_tensor([person_obj])
+                        obj_features = self.transreid_processor.extract_features(
+                            obj_tensor
+                        )
+                        obj_features = torch.nn.functional.normalize(
+                            obj_features, dim=1, p=2
+                        )
+
+                        # Search for similar embeddings
+                        similar_matches = (
+                            self.weaviate_manager.vector_store.search_similar(
+                                obj_features, top_k=5, distance_threshold=0.8
+                            )
+                        )
+
+                        # Add matches to results (exclude self)
+                        for match in similar_matches:
+                            match_object_id = match.get("object_id")
+                            if match_object_id != str(detection_id):
+                                similar_results.append(match)
+
+                    except Exception as e:
+                        print(f"Could not fetch similar images for {person_id}: {e}")
+
+                # Debug: Check base64 data in similar results
+                has_base64_images = 0
+                for similar in similar_results:
+                    if similar.get("image_crop_base64", "").strip():
+                        has_base64_images += 1
+                print(
+                    f"🔍 Found {has_base64_images}/{len(similar_results)} similar results with base64 image data"
+                )
+
+                # Save individual person results
+                saver = ReIDResultsSaver("results")
+                image_name = f"person_{person_id}_frame_{frame_id}_cam_{camera_id}"
+
+                results_folder = saver.save_complete_results(
+                    image_name=image_name,
+                    original_image=original_image,
+                    reid_results=[result],  # Only this person's result
+                    similar_results=similar_results,
+                )
+                print(f"Saved person {person_id} results to: {results_folder}")
+
+        except Exception as e:
+            print(f"❌ Error saving results: {e}")
+
+    def close(self):
+        self.receiver.close()
+
+    def stop(self):
+        print("\nShutting down gracefully...")
+        # Close Weaviate
+        if hasattr(self, 'weaviate_manager') and self.weaviate_manager.client:
+            self.weaviate_manager.client.close()
+            print("✓ Weaviate connection closed.")
+        
+        # Close MongoDB
+        if hasattr(self, 'mongo_storage') and self.mongo_storage.client:
+            self.mongo_storage.client.close()
+            print("✓ MongoDB connection closed.")
+            
+            
+            
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="C2 ReID with TSN/UDP input and Weaviate")
+    parser.add_argument("--listen_ip", type=str, default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=12345)
+    parser.add_argument("--weaviate_url", type=str, default="http://localhost:8080")
+    parser.add_argument(
+        "--transreid_model_path",
+        type=str,
+        default="/home/jdg24001/Documents/github/Secure-Camera/weights-models/weights/transformer_best.pth",
+    )
+    parser.add_argument(
+        "--similarity_threshold",
+        type=float,
+        default=0.98,
+        help="Similarity threshold for person matching",
+    )
+    
+    parser.add_argument(
+        "--save_results", action="store_true", help="Save processing results to file"
+    )
+    parser.add_argument(
+        "--save_json", action="store_true", help="Save reid_results JSON files"
+    )
+    parser.add_argument(
+        "--store_crops",
+        action="store_true",
+        help="Store image crops in Weaviate as base64",
+    )
+    parser.add_argument(
+        "--verbose", action="store_true", help="Enable verbose debug output"
+    )
+
+    parser.add_argument(
+        "--disable_object_prediction",
+        action="store_true",
+        help="Disable history-based prediction for omitted existing objects",
+    )
+    parser.add_argument(
+        "--camera_fps",
+        type=float,
+        default=25.0,
+        help="Source FPS used when capture timestamps are not transmitted",
+    )
+    parser.add_argument(
+        "--prediction_history",
+        type=int,
+        default=10,
+        help="Maximum number of actual observations retained per track",
+    )
+    parser.add_argument(
+        "--prediction_max_missed",
+        type=int,
+        default=3,
+        help="Maximum number of consecutive frames for track prediction",
+    )
+    parser.add_argument(
+        "--prediction_max_speed_kmh",
+        type=float,
+        default=180.0,
+        help="Maximum plausible radial speed used to limit distance outliers",
+    )
+    parser.add_argument(
+        "--prediction_frame_width",
+        type=int,
+        default=1920,
+        help="Default frame width used to clip predicted bounding boxes",
+    )
+    parser.add_argument(
+        "--prediction_frame_height",
+        type=int,
+        default=1080,
+        help="Default frame height used to clip predicted bounding boxes",
+    )
+    parser.add_argument(
+        "--save_predictions",
+        action="store_true",
+        help="Save predicted existing objects as JSON files",
+    )
+    parser.add_argument(
+        "--prediction_output_dir",
+        type=str,
+        default="predicted_objects",
+        help="Directory used by --save_predictions",
+    )
+
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    print("===== ARGUMENTS =====")
+    for arg, value in vars(args).items():
+        print(f"{arg}: {value}")
+    print("=====================")
+
+    processor = None
     try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
+        processor = C2Processor(args)
+        processor.run()
+    except KeyboardInterrupt:
+        print("\nReceiver stopped by user.")
+    finally:
+        if processor is not None:
+            processor.close()
 
 
-def _as_float(value, default=None):
-    try:
-        result = float(value)
-        return result if np.isfinite(result) else default
-    except (TypeError, ValueError):
-        return default
-
-
-def _first_float(mapping: Dict, *names) -> Optional[float]:
-    for name in names:
-        value = _as_float(mapping.get(name))
-        if value is not None:
-            return value
-    return None
-
-
-def _first_text(mapping: Dict, *names) -> Optional[str]:
-    for name in names:
-        value = mapping.get(name)
-        if value is None:
-            continue
-        text = str(value).strip()
-        if text and text.lower() not in {"none", "null", "nan", "unknown"}:
-            return text
-    return None
-
-
-__all__ = [
-    "ExistingObjectPredictor",
-    "ObjectMotionGRU",
-    "history_to_model_tensor",
-]
+if __name__ == "__main__":
+    main()

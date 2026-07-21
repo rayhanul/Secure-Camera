@@ -25,7 +25,52 @@ from utils.weaviate import ReIDVectorStore
 # ================= PREDICTION MODIFICATION 1 =================
 # Keep object-history storage, model feeding, and prediction logic in a
 # separate module placed in the same directory as this main file.
-from prediction_module.object_prediction import ExistingObjectPredictor
+from object_prediction import ExistingObjectPredictor
+
+# Prediction is internal program behavior; it does not require CLI arguments.
+# Change values here if the camera or trained model configuration changes.
+PREDICTION_CONFIG = {
+    "enabled": True,
+    # True: also predict frame N+1 after complete frame N data is received.
+    # False: predict only when an object or one of its properties is missing.
+    "continuous_prediction": True,
+    # Evaluation mode: deliberately hide selected fields from some known
+    # objects, predict them, and compare against the untouched received values.
+    "simulate_missing_fields": True,
+    "simulation_every_n_frames": 1,
+    "simulation_object_stride": 2,
+    "simulation_min_history": 3,
+    "simulation_fields": [
+        "bbox",
+        "distance_m",
+        "bearing_deg",
+        "direction",
+        "speed_kmh",
+    ],
+    "camera_fps": 25.0,
+    "history_size": 10,
+    "max_missed_frames": 3,
+    "max_speed_kmh": 180.0,
+    "frame_width": 1920,
+    "frame_height": 1080,
+    "max_distance_m": 500.0,
+    "max_bearing_deg": 45.0,
+    # Set this to a trained ObjectMotionGRU checkpoint when available.
+    "model_path": None,
+    "model_device": "auto",
+    "model_hidden_size": 128,
+    "model_num_layers": 2,
+    # Store only actual observations here. Predictions are stored separately.
+    "history_store_path": os.path.join(
+        "prediction_data",
+        "actual_object_history.jsonl",
+    ),
+    "save_predictions": True,
+    "prediction_output_dir": os.path.join(
+        "prediction_data",
+        "predictions",
+    ),
+}
 # =============== END PREDICTION MODIFICATION 1 ===============
 
 
@@ -764,20 +809,24 @@ class C2Processor:
         # by (camera_id, camera_location, track_id). A trained GRU checkpoint is
         # optional; without it, robust history extrapolation is used.
         self.object_predictor = None
-        if not args.disable_object_prediction:
+        if PREDICTION_CONFIG["enabled"]:
             self.object_predictor = ExistingObjectPredictor(
-                fps=args.camera_fps,
-                history_size=args.prediction_history,
-                max_missed_frames=args.prediction_max_missed,
-                max_radial_speed_kmh=args.prediction_max_speed_kmh,
-                frame_width=args.prediction_frame_width,
-                frame_height=args.prediction_frame_height,
-                model_path=args.prediction_model_path,
-                model_device=args.prediction_device,
-                model_hidden_size=args.prediction_hidden_size,
-                model_num_layers=args.prediction_num_layers,
-                max_distance_m=args.prediction_max_distance_m,
-                max_bearing_deg=args.prediction_max_bearing_deg,
+                fps=PREDICTION_CONFIG["camera_fps"],
+                history_size=PREDICTION_CONFIG["history_size"],
+                max_missed_frames=PREDICTION_CONFIG["max_missed_frames"],
+                max_radial_speed_kmh=PREDICTION_CONFIG["max_speed_kmh"],
+                frame_width=PREDICTION_CONFIG["frame_width"],
+                frame_height=PREDICTION_CONFIG["frame_height"],
+                model_path=PREDICTION_CONFIG["model_path"],
+                model_device=PREDICTION_CONFIG["model_device"],
+                model_hidden_size=PREDICTION_CONFIG["model_hidden_size"],
+                model_num_layers=PREDICTION_CONFIG["model_num_layers"],
+                max_distance_m=PREDICTION_CONFIG["max_distance_m"],
+                max_bearing_deg=PREDICTION_CONFIG["max_bearing_deg"],
+                history_store_path=PREDICTION_CONFIG["history_store_path"],
+                continuous_prediction=PREDICTION_CONFIG[
+                    "continuous_prediction"
+                ],
             )
             prediction_method = (
                 "trained GRU"
@@ -787,8 +836,10 @@ class C2Processor:
             print(
                 "Existing-object prediction enabled: "
                 f"method={prediction_method}, "
-                f"history={args.prediction_history}, "
-                f"max_missed={args.prediction_max_missed}"
+                f"history={PREDICTION_CONFIG['history_size']}, "
+                f"max_missed={PREDICTION_CONFIG['max_missed_frames']}, "
+                f"continuous={PREDICTION_CONFIG['continuous_prediction']}, "
+                f"input_store={PREDICTION_CONFIG['history_store_path']}"
             )
         # =============== END PREDICTION MODIFICATION 2 ===============
         
@@ -826,34 +877,527 @@ class C2Processor:
         self.stats_interval = 15
 
     # ================= PREDICTION MODIFICATION 3 =================
+    @staticmethod
+    def _first_packet_value(mapping: Dict, *names, default=None):
+        for name in names:
+            value = mapping.get(name)
+            if value is not None:
+                return value
+        return default
+
+    def print_received_object_properties(self, data: Dict) -> None:
+        """Print every received object before prediction or ReID filtering.
+
+        A track is labelled ``existing`` when its ID already has real
+        observations in the server-side prediction history. This check is
+        performed before the current packet is written to history.
+        """
+        metadata = data.get("metadata") or {}
+        objects = data.get("objects") or []
+
+        def first_value(obj: Dict, *names, default=None):
+            for name in names:
+                value = obj.get(name)
+                if value is not None:
+                    return value
+            return default
+
+        frame_id = first_value(
+            metadata, "frame_id", default=data.get("frame_id", "unknown")
+        )
+        camera_id = first_value(
+            metadata,
+            "camera_id",
+            "camera",
+            default=data.get("camera_id", "unknown"),
+        )
+        camera_location = first_value(
+            metadata,
+            "camera_location",
+            "location",
+            default=data.get("camera_location", "unknown"),
+        )
+
+        track_states = []
+        existing_count = 0
+        new_count = 0
+        for obj in objects:
+            if not isinstance(obj, dict):
+                track_states.append("unknown")
+                continue
+            track_id = first_value(
+                obj, "track_id", "object_track_id", "object_id"
+            )
+            is_existing = bool(
+                track_id is not None
+                and self.object_predictor is not None
+                and self.object_predictor.has_prior_history(
+                    camera_id,
+                    camera_location,
+                    track_id,
+                    frame_id,
+                )
+            )
+            track_state = "existing" if is_existing else "new"
+            track_states.append(track_state)
+            if is_existing:
+                existing_count += 1
+            else:
+                new_count += 1
+
+        print(
+            f"\n[RECEIVED OBJECTS] frame_id={frame_id} "
+            f"camera={camera_id} location={camera_location} "
+            f"count={len(objects)} existing={existing_count} new={new_count}",
+            flush=True,
+        )
+
+        if not objects:
+            print("  No object records were received in this packet.", flush=True)
+            return
+
+        for index, obj in enumerate(objects):
+            if not isinstance(obj, dict):
+                print(
+                    f"  received object {index}: invalid_record={obj!r}",
+                    flush=True,
+                )
+                continue
+
+            explicit_has_crop = obj.get("has_crop")
+            has_crop = (
+                bool(explicit_has_crop)
+                if explicit_has_crop is not None
+                else any(
+                    obj.get(name) not in (None, "")
+                    for name in (
+                        "crop_jpg_b64",
+                        "image_crop_base64",
+                        "crop",
+                    )
+                )
+            )
+
+            explicit_has_processed = obj.get("has_processed")
+            has_processed = (
+                bool(explicit_has_processed)
+                if explicit_has_processed is not None
+                else obj.get("processed_image") is not None
+            )
+
+            print(
+                f"  received {track_states[index]} object {index}: "
+                f"class={first_value(obj, 'class_name', 'class', default='unknown')} "
+                f"conf={first_value(obj, 'confidence', 'conf')} "
+                f"track_id={first_value(obj, 'track_id', 'object_track_id', 'object_id')} "
+                f"bbox={obj.get('bbox')} "
+                f"distance_m={first_value(obj, 'distance_m', 'distance')} "
+                f"bearing_deg={first_value(obj, 'bearing_deg', 'bearing_angle')} "
+                f"direction={first_value(obj, 'direction', 'motion_direction')} "
+                f"speed_kmh={first_value(obj, 'speed_kmh', 'speed')} "
+                f"privacy_level={obj.get('privacy_level')} "
+                f"jpeg_crop_size={obj.get('jpeg_crop_size')} "
+                f"serialized_object_size={obj.get('serialized_object_size')} "
+                f"has_crop={has_crop} "
+                f"has_processed={has_processed}",
+                flush=True,
+            )
+
+    @classmethod
+    def _minimal_prediction_observation(cls, obj: Dict) -> Optional[Dict]:
+        """Remove crops, embeddings, encryption, and detailed metadata.
+
+        The returned record contains only fields needed to identify a track,
+        update its numerical history, or preserve an actually received motion
+        value while the remaining properties are predicted.
+        """
+        track_id = cls._first_packet_value(
+            obj, "track_id", "object_track_id", "object_id"
+        )
+        if track_id is None:
+            return None
+
+        minimal = {"track_id": track_id}
+        aliases = {
+            "class_name": ("class_name", "class"),
+            "class_id": ("class_id",),
+            "confidence": ("confidence", "conf"),
+            "bbox": ("bbox",),
+            "distance_m": ("distance_m", "distance"),
+            "bearing_deg": ("bearing_deg", "bearing_angle"),
+            "direction": ("direction", "motion_direction"),
+            "speed_kmh": ("speed_kmh", "speed"),
+        }
+        for output_name, input_names in aliases.items():
+            value = cls._first_packet_value(obj, *input_names)
+            if value is not None:
+                minimal[output_name] = value
+        return minimal
+
+    @classmethod
+    def _packet_requests_prediction(cls, data: Dict) -> bool:
+        metadata = data.get("metadata", {})
+        mode = str(
+            cls._first_packet_value(
+                metadata,
+                "transmission_mode",
+                default=data.get("transmission_mode", ""),
+            )
+        ).lower()
+        reduced_modes = {
+            "new_objects_only",
+            "reduced_existing_objects",
+            "prediction_only",
+            "gcl_reconfiguration",
+            "empty_existing_data",
+            "minimal_existing_data",
+            "metadata_only",
+        }
+        return bool(
+            metadata.get("existing_objects_omitted")
+            or metadata.get("prediction_required")
+            or metadata.get("object_data_empty")
+            or metadata.get("existing_object_data_empty")
+            or metadata.get("existing_track_ids")
+            or data.get("existing_objects_omitted")
+            or data.get("prediction_required")
+            or data.get("object_data_empty")
+            or data.get("existing_object_data_empty")
+            or data.get("existing_track_ids")
+            or mode in reduced_modes
+        )
+
     def process_object_predictions(self, data: Dict) -> List[Dict]:
-        """Store actual observations and predict missing existing objects.
+        """Adapt a full packet to the predictor's minimal-data interface.
 
         Predictions are attached to ``predicted_existing_objects`` instead of
         ``objects`` because they have no real crop or ReID embedding and must
         not be stored as actual observations.
         """
+        # Print the real packet at the prediction boundary, before history is
+        # updated and before process_detection() applies its person/ReID filter.
+        self.print_received_object_properties(data)
+
         if self.object_predictor is None:
             return []
 
-        predictions = self.object_predictor.process_packet(data)
+        metadata = data.get("metadata", {})
+        frame_id = self._first_packet_value(metadata, "frame_id", default=0)
+        try:
+            frame_id = int(frame_id)
+        except (TypeError, ValueError):
+            frame_id = 0
+        timestamp = self._first_packet_value(
+            metadata,
+            "capture_timestamp",
+            "timestamp",
+            "timestamp_s",
+            default=None,
+        )
+        camera_id = metadata.get("camera_id", "unknown")
+        camera_location = metadata.get("camera_location", "unknown")
+        frame_width = self._first_packet_value(
+            metadata,
+            "frame_width",
+            "image_width",
+            default=PREDICTION_CONFIG["frame_width"],
+        )
+        frame_height = self._first_packet_value(
+            metadata,
+            "frame_height",
+            "image_height",
+            default=PREDICTION_CONFIG["frame_height"],
+        )
+
+        # The full packet stays in this server adapter. Only this sanitized
+        # list crosses into the prediction module.
+        minimal_observations = [
+            observation
+            for observation in (
+                self._minimal_prediction_observation(obj)
+                for obj in (data.get("objects") or [])
+            )
+            if observation is not None
+        ]
+
+        # Freeze new/existing status before storing anything from the current
+        # frame. A track is existing only if it appeared in an earlier frame.
+        prior_existing_track_ids = set()
+        new_track_ids = set()
+        for observation in minimal_observations:
+            track_key = str(observation["track_id"])
+            if self.object_predictor.has_prior_history(
+                camera_id,
+                camera_location,
+                observation["track_id"],
+                frame_id,
+            ):
+                prior_existing_track_ids.add(track_key)
+            else:
+                new_track_ids.add(track_key)
+
+        existing_full_observations = []
+        partial_descriptors = []
+        fully_received_track_ids = set()
+        for observation in minimal_observations:
+            track_id = str(observation["track_id"])
+            was_seen_in_previous_frame = (
+                track_id in prior_existing_track_ids
+            )
+            missing_fields = self.object_predictor.missing_prediction_fields(
+                observation
+            )
+            if not missing_fields:
+                fully_received_track_ids.add(track_id)
+                if was_seen_in_previous_frame:
+                    existing_full_observations.append(observation)
+            elif was_seen_in_previous_frame:
+                partial_descriptors.append(observation)
+
+        print(
+            f"[PREDICTION ELIGIBILITY] frame_id={frame_id} "
+            f"existing_track_ids={sorted(prior_existing_track_ids)} "
+            f"new_track_ids={sorted(new_track_ids)} "
+            f"new_objects_excluded={len(new_track_ids)}",
+            flush=True,
+        )
+
+        # ================= SIMULATED MISSING-DATA EVALUATION =================
+        # Keep the untouched values as ground truth, but remove configured
+        # fields from every Nth known object before calling predict_tracks().
+        simulation_ground_truth = []
+        simulation_descriptors = []
+        simulation_track_ids = set()
+        simulation_enabled = bool(
+            PREDICTION_CONFIG["simulate_missing_fields"]
+        )
+        simulation_every = max(
+            1, int(PREDICTION_CONFIG["simulation_every_n_frames"])
+        )
+        simulation_stride = max(
+            1, int(PREDICTION_CONFIG["simulation_object_stride"])
+        )
+        simulation_min_history = max(
+            1, int(PREDICTION_CONFIG["simulation_min_history"])
+        )
+        simulation_fields = list(
+            PREDICTION_CONFIG["simulation_fields"]
+        )
+
+        if simulation_enabled and frame_id % simulation_every == 0:
+            for object_index, observation in enumerate(
+                existing_full_observations
+            ):
+                if object_index % simulation_stride != 0:
+                    continue
+                track_id = observation["track_id"]
+                if self.object_predictor.history_length(
+                    camera_id, camera_location, track_id
+                ) < simulation_min_history:
+                    continue
+
+                masked_descriptor = dict(observation)
+                removed_fields = []
+                for field in simulation_fields:
+                    if field in masked_descriptor:
+                        del masked_descriptor[field]
+                        removed_fields.append(field)
+                if not removed_fields:
+                    continue
+
+                track_key = str(track_id)
+                simulation_track_ids.add(track_key)
+                simulation_ground_truth.append(observation)
+                simulation_descriptors.append(masked_descriptor)
+                print(
+                    f"[SIMULATED MISSING DATA] frame_id={frame_id} "
+                    f"object_index={object_index} track_id={track_id} "
+                    f"removed_fields={removed_fields} "
+                    f"model_input_fields={sorted(masked_descriptor.keys())}"
+                )
+
+        # Compare ordinary cached predictions now. Ground-truth records chosen
+        # for simulation are compared only after their masked prediction runs,
+        # preventing duplicate comparisons for the same object and frame.
+        ordinary_comparison_observations = [
+            observation
+            for observation in minimal_observations
+            if str(observation["track_id"]) not in simulation_track_ids
+        ]
+        comparisons = self.object_predictor.compare_received_observations(
+            camera_id=camera_id,
+            camera_location=camera_location,
+            frame_id=frame_id,
+            observations=ordinary_comparison_observations,
+        )
+        # =============== END SIMULATED MISSING-DATA EVALUATION ===============
+
+        prediction_requested = self._packet_requests_prediction(data)
+        omitted_ids = self._first_packet_value(
+            metadata,
+            "omitted_track_ids",
+            "existing_track_ids",
+            "tracks_to_predict",
+            default=self._first_packet_value(
+                data,
+                "omitted_track_ids",
+                "existing_track_ids",
+                "tracks_to_predict",
+            ),
+        )
+
+        # Current-frame inference descriptors contain only the track ID unless
+        # a partial lightweight record supplied one or more real properties.
+        current_descriptors_by_id = {
+            str(item["track_id"]): item for item in partial_descriptors
+        }
+        if isinstance(omitted_ids, (list, tuple, set)):
+            for track_id in omitted_ids:
+                track_key = str(track_id)
+                if (
+                    track_key not in fully_received_track_ids
+                    and self.object_predictor.has_prior_history(
+                        camera_id,
+                        camera_location,
+                        track_id,
+                        frame_id,
+                    )
+                ):
+                    current_descriptors_by_id.setdefault(
+                        track_key, {"track_id": track_id}
+                    )
+        elif prediction_requested:
+            for track_id in self.object_predictor.known_track_ids(
+                camera_id, camera_location
+            ):
+                if (
+                    track_id not in fully_received_track_ids
+                    and self.object_predictor.has_prior_history(
+                        camera_id,
+                        camera_location,
+                        track_id,
+                        frame_id,
+                    )
+                ):
+                    current_descriptors_by_id.setdefault(
+                        track_id, {"track_id": track_id}
+                    )
+
+        predictions = []
+        if current_descriptors_by_id:
+            target_frame = self._first_packet_value(
+                metadata,
+                "prediction_target_frame_id",
+                default=frame_id,
+            )
+            predictions.extend(
+                self.object_predictor.predict_tracks(
+                    camera_id=camera_id,
+                    camera_location=camera_location,
+                    reference_frame_id=frame_id,
+                    reference_timestamp=timestamp,
+                    target_frame_id=target_frame,
+                    track_descriptors=list(
+                        current_descriptors_by_id.values()
+                    ),
+                    frame_width=frame_width,
+                    frame_height=frame_height,
+                    prediction_reason="omitted_existing_object",
+                    merge_partial_values=True,
+                    actual_payload_pending=True,
+                )
+            )
+
+        # Predict the deliberately hidden fields for the current frame using
+        # history ending at frame N-1, then compare against the untouched
+        # values that were actually received for frame N.
+        if simulation_descriptors:
+            simulated_predictions = self.object_predictor.predict_tracks(
+                camera_id=camera_id,
+                camera_location=camera_location,
+                reference_frame_id=frame_id,
+                reference_timestamp=timestamp,
+                target_frame_id=frame_id,
+                track_descriptors=simulation_descriptors,
+                frame_width=frame_width,
+                frame_height=frame_height,
+                prediction_reason="simulated_missing_fields",
+                merge_partial_values=True,
+                actual_payload_pending=False,
+            )
+            predictions.extend(simulated_predictions)
+
+            simulation_comparisons = (
+                self.object_predictor.compare_received_observations(
+                    camera_id=camera_id,
+                    camera_location=camera_location,
+                    frame_id=frame_id,
+                    observations=simulation_ground_truth,
+                )
+            )
+            comparisons.extend(simulation_comparisons)
+
+        if comparisons:
+            data["prediction_comparisons"] = comparisons
+            self.print_prediction_comparisons(comparisons)
+
+        # History receives only the sanitized numerical observations. An
+        # ID-only descriptor has no bbox and is therefore not stored as fact.
+        self.object_predictor.update_history(
+            camera_id=camera_id,
+            camera_location=camera_location,
+            frame_id=frame_id,
+            timestamp=timestamp,
+            observations=minimal_observations,
+        )
+
+        # For complete objects, update history with frame N first and then ask
+        # for frame N+1 using only track_id and optional class_name.
+        if (
+            PREDICTION_CONFIG["continuous_prediction"]
+            and existing_full_observations
+        ):
+            next_frame = self._first_packet_value(
+                metadata,
+                "continuous_prediction_target_frame_id",
+                default=int(frame_id) + 1,
+            )
+            next_frame_descriptors = [
+                {
+                    "track_id": observation["track_id"],
+                    **(
+                        {"class_name": observation["class_name"]}
+                        if observation.get("class_name") is not None
+                        else {}
+                    ),
+                }
+                for observation in existing_full_observations
+            ]
+            predictions.extend(
+                self.object_predictor.predict_tracks(
+                    camera_id=camera_id,
+                    camera_location=camera_location,
+                    reference_frame_id=frame_id,
+                    reference_timestamp=timestamp,
+                    target_frame_id=next_frame,
+                    track_descriptors=next_frame_descriptors,
+                    frame_width=frame_width,
+                    frame_height=frame_height,
+                    prediction_reason="continuous_next_frame",
+                    merge_partial_values=False,
+                    actual_payload_pending=False,
+                )
+            )
+
         data["predicted_existing_objects"] = predictions
 
         if not predictions:
-            if self.object_predictor.prediction_requested(data):
+            if prediction_requested:
                 print(
                     "[PREDICTION] Prediction was requested, but no eligible "
                     "existing tracks were found in server history"
                 )
             return []
-
-        metadata = data.get("metadata", {})
-        frame_id = metadata.get(
-            "prediction_target_frame_id",
-            metadata.get("frame_id", "unknown"),
-        )
-        camera_id = metadata.get("camera_id", "unknown")
-        camera_location = metadata.get("camera_location", "unknown")
 
         print("\n" + "=" * 80)
         print(
@@ -862,24 +1406,131 @@ class C2Processor:
             f"predicted_existing_objects={len(predictions)}"
         )
         for index, obj in enumerate(predictions):
+            existing = obj.get("existing_object_used_for_prediction") or {}
+
+            print(
+                f"  received existing object {index}: "
+                f"class={existing.get('class_name')} "
+                f"track_id={existing.get('track_id')} "
+                f"source_frame={existing.get('frame_id')} "
+                f"bbox={existing.get('bbox')} "
+                f"distance_m={existing.get('distance_m')} "
+                f"bearing_deg={existing.get('bearing_deg')} "
+                f"direction={existing.get('direction')} "
+                f"speed_kmh={existing.get('speed_kmh')} "
+                f"confidence={existing.get('confidence')}"
+            )
             print(
                 f"  predicted object {index}: "
                 f"class={obj.get('class_name')} "
-                f"track_id={obj.get('track_id')} "
+                f"predicted_track_id={obj.get('track_id')} "
+                f"track_status={obj.get('track_status', 'existing')} "
+                f"target_frame={obj.get('predicted_for_frame_id')} "
                 f"bbox={obj.get('bbox')} "
                 f"distance_m={obj.get('distance_m')} "
                 f"bearing_deg={obj.get('bearing_deg')} "
                 f"direction={obj.get('direction')} "
                 f"speed_kmh={obj.get('speed_kmh')} "
+                f"reason={obj.get('prediction_reason')} "
                 f"predicted_fields={obj.get('predicted_fields')} "
+                f"held_out_fields="
+                f"{obj.get('simulated_missing_fields', [])} "
                 f"source={obj.get('prediction_source')} "
-                f"confidence={obj.get('prediction_confidence')}"
+                f"confidence={obj.get('prediction_confidence')} "
+                f"inference_input_fields="
+                f"{obj.get('inference_input_fields')}"
             )
         print("=" * 80)
 
-        if self.args.save_predictions:
+        if PREDICTION_CONFIG["save_predictions"]:
             self.save_predicted_objects(data, predictions)
         return predictions
+
+    @staticmethod
+    def print_prediction_comparisons(comparisons: List[Dict]):
+        """Print predicted, received, and error values side by side."""
+        print("\n" + "=" * 100)
+        print("[PREDICTED VS RECEIVED OBJECT PROPERTIES]")
+        for comparison in comparisons:
+            predicted = comparison["predicted"]
+            received = comparison["received"]
+            error = comparison["error"]
+            print(
+                f"  frame_id={comparison['frame_id']} "
+                f"camera={comparison['camera_id']} "
+                f"location={comparison['camera_location']} "
+                f"track_id={comparison['track_id']} "
+                f"source={comparison['prediction_source']} "
+                f"reason={comparison.get('prediction_reason')} "
+                f"held_out_fields="
+                f"{comparison.get('simulated_missing_fields', [])} "
+                f"prediction_confidence="
+                f"{comparison['prediction_confidence']}"
+            )
+
+            print(
+                f"    class:      predicted={predicted['class_name']} "
+                f"received={received['class_name']} "
+                f"match={error['class_match']}"
+            )
+            confidence_error = error["confidence"]
+            confidence_error_text = (
+                "not_available"
+                if confidence_error is None
+                else (
+                    f"signed_error={confidence_error['signed_error']} "
+                    f"absolute_error={confidence_error['absolute_error']}"
+                )
+            )
+            print(
+                f"    confidence: predicted={predicted['confidence']} "
+                f"received={received['confidence']} "
+                f"{confidence_error_text}"
+            )
+
+            bbox_error = error["bbox"]
+            bbox_error_text = (
+                "not_available"
+                if bbox_error is None
+                else (
+                    f"coordinate_error_px="
+                    f"{bbox_error['coordinate_error_px']} "
+                    f"mae_px={bbox_error['mean_absolute_error_px']} "
+                    f"center_error_px={bbox_error['center_error_px']} "
+                    f"iou={bbox_error['iou']}"
+                )
+            )
+            print(
+                f"    bbox:       predicted={predicted['bbox']} "
+                f"received={received['bbox']} {bbox_error_text}"
+            )
+
+            for field, unit in (
+                ("distance_m", "m"),
+                ("bearing_deg", "deg"),
+                ("speed_kmh", "km/h"),
+            ):
+                field_error = error[field]
+                error_text = (
+                    "not_available"
+                    if field_error is None
+                    else (
+                        f"signed_error={field_error['signed_error']} {unit} "
+                        f"absolute_error={field_error['absolute_error']} {unit}"
+                    )
+                )
+                print(
+                    f"    {field + ':':11} "
+                    f"predicted={predicted[field]} "
+                    f"received={received[field]} {error_text}"
+                )
+
+            print(
+                f"    direction:  predicted={predicted['direction']} "
+                f"received={received['direction']} "
+                f"match={error['direction_match']}"
+            )
+        print("=" * 100)
 
     def save_predicted_objects(self, data: Dict, predictions: List[Dict]):
         metadata = data.get("metadata", {})
@@ -893,9 +1544,10 @@ class C2Processor:
             character if character.isalnum() or character in "-_" else "_"
             for character in f"{camera_location}_{camera_id}"
         )
-        os.makedirs(self.args.prediction_output_dir, exist_ok=True)
+        prediction_output_dir = PREDICTION_CONFIG["prediction_output_dir"]
+        os.makedirs(prediction_output_dir, exist_ok=True)
         filename = os.path.join(
-            self.args.prediction_output_dir,
+            prediction_output_dir,
             f"{safe_camera}_frame_{frame_id}_predicted.json",
         )
         output = {
@@ -908,6 +1560,7 @@ class C2Processor:
                 "actual_payload_pending": True,
             },
             "objects": predictions,
+            "comparisons": data.get("prediction_comparisons", []),
         }
         try:
             with open(filename, "w") as prediction_file:
@@ -1056,7 +1709,10 @@ class C2Processor:
             ]
 
             if not valid_objects:
-                print("No valid person objects with processed_image found")
+                print(
+                    "[REID SKIP] No person objects with processed_image; "
+                    "all received objects were printed above"
+                )
                 return []
 
             data["objects"] = valid_objects
@@ -1269,8 +1925,8 @@ class C2Processor:
 
                 if payload_type == "detected_objects":
                     # ================= PREDICTION MODIFICATION 4 =================
-                    # Run before process_detection(), which filters the packet
-                    # down to person objects that contain real image crops.
+                    # This prints the unmodified packet first, then predicts
+                    # before process_detection() applies ReID-only filtering.
                     predictions = self.process_object_predictions(data)
                     # =============== END PREDICTION MODIFICATION 4 ===============
 
@@ -1478,80 +2134,6 @@ def parse_args():
     parser.add_argument(
         "--verbose", action="store_true", help="Enable verbose debug output"
     )
-
-    # ================= PREDICTION MODIFICATION 5 =================
-    # Runtime and optional trained-model configuration.
-    parser.add_argument(
-        "--disable_object_prediction",
-        action="store_true",
-        help="Disable server-side prediction of omitted existing objects",
-    )
-    parser.add_argument(
-        "--camera_fps",
-        type=float,
-        default=25.0,
-        help="Source FPS used when capture timestamps are unavailable",
-    )
-    parser.add_argument(
-        "--prediction_history",
-        type=int,
-        default=10,
-        help="Number of actual observations retained and fed to the model",
-    )
-    parser.add_argument(
-        "--prediction_max_missed",
-        type=int,
-        default=3,
-        help="Maximum number of consecutive frames predicted per track",
-    )
-    parser.add_argument(
-        "--prediction_max_speed_kmh",
-        type=float,
-        default=180.0,
-        help="Maximum plausible radial speed used to limit distance outliers",
-    )
-    parser.add_argument(
-        "--prediction_frame_width", type=int, default=1920
-    )
-    parser.add_argument(
-        "--prediction_frame_height", type=int, default=1080
-    )
-    parser.add_argument(
-        "--prediction_max_distance_m", type=float, default=500.0
-    )
-    parser.add_argument(
-        "--prediction_max_bearing_deg", type=float, default=45.0
-    )
-    parser.add_argument(
-        "--prediction_model_path",
-        type=str,
-        default=None,
-        help="Optional trained ObjectMotionGRU checkpoint",
-    )
-    parser.add_argument(
-        "--prediction_device",
-        type=str,
-        default="auto",
-        help="Prediction model device: auto, cpu, cuda, or cuda:N",
-    )
-    parser.add_argument(
-        "--prediction_hidden_size", type=int, default=128
-    )
-    parser.add_argument(
-        "--prediction_num_layers", type=int, default=2
-    )
-    parser.add_argument(
-        "--save_predictions",
-        action="store_true",
-        help="Save predicted existing objects as JSON files",
-    )
-    parser.add_argument(
-        "--prediction_output_dir",
-        type=str,
-        default="predicted_objects",
-        help="Output directory used with --save_predictions",
-    )
-    # =============== END PREDICTION MODIFICATION 5 ===============
 
     return parser.parse_args()
 

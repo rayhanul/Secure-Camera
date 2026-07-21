@@ -800,9 +800,10 @@ class C2Processor:
 
     def __init__(self, args):
         self.args = args
-
-        # Initialize components
-        self.receiver = TSNReceiver(args.listen_ip, args.port)
+        # Open the UDP receiver only after every other dependency has
+        # initialized successfully.  If predictor or Weaviate startup fails,
+        # no bound socket is left behind.
+        self.receiver = None
 
         # ================= PREDICTION MODIFICATION 2 =================
         # Create one predictor for all cameras. It internally separates history
@@ -864,9 +865,6 @@ class C2Processor:
             ]
         )
 
-        print("TSN receiver with Weaviate ReID initialized")
-
-
         # Runtime statistics... ... ... 
 
         self.start_time = time.time()
@@ -875,6 +873,11 @@ class C2Processor:
         self.new_persons = 0
         self.existing_persons = 0
         self.stats_interval = 15
+
+        # Keep this last: C2Processor.__init__ must not leave an open UDP
+        # socket when an earlier dependency raises an exception.
+        self.receiver = TSNReceiver(args.listen_ip, args.port)
+        print("TSN receiver with Weaviate ReID initialized")
 
     # ================= PREDICTION MODIFICATION 3 =================
     @staticmethod
@@ -2086,7 +2089,22 @@ class C2Processor:
             print(f"❌ Error saving results: {e}")
 
     def close(self):
-        self.receiver.close()
+        receiver = getattr(self, "receiver", None)
+        if receiver is not None:
+            try:
+                receiver.close()
+            except OSError:
+                pass
+            self.receiver = None
+
+        weaviate_manager = getattr(self, "weaviate_manager", None)
+        vector_store = getattr(weaviate_manager, "vector_store", None)
+        client = getattr(vector_store, "client", None)
+        if client is not None:
+            try:
+                client.close()
+            except Exception as error:
+                print(f"Warning: could not close Weaviate client: {error}")
 
     def stop(self):
         print("\nShutting down gracefully...")

@@ -1,0 +1,6 @@
+ object 0: class=vehicle conf=0.8030451536178589 bbox=[1175, 342, 1329, 495] track_id=1 distance_m=35.881 bearing_deg=13.86 direction=stationary speed_kmh=0.0 has_crop=True has_processed=False
+  object 1: class=vehicle conf=0.8126030564308167 bbox=[0, 284, 109, 352] track_id=2 distance_m=137.144 bearing_deg=-32.31 direction=stationary speed_kmh=0.0 has_crop=True has_processed=False
+  object 2: class=vehicle conf=0.7702702879905701 bbox=[459, 306, 611, 423] track_id=3 distance_m=59.448 bearing_deg=-17.99 direction=stationary speed_kmh=0.001 has_crop=True has_processed=False
+  object 3: class=vehicle conf=0.7571980357170105 bbox=[3, 335, 546, 621] track_id=4 distance_m=22.512 bearing_deg=-35.4 direction=unknown speed_kmh=1.365 has_crop=True has_processed=False
+  object 4: class=vehicle conf=0.6963626146316528 bbox=[532, 231, 609, 283] track_id=5 distance_m=875.965 bearing_deg=-14.09 direction=stationary speed_kmh=0.0 has_crop=True has_processed=False
+  object 5: class=vehicle conf=0.6122335195541382 bbox=[797, 235, 946, 388] track_id=6 distance_m=76.962 bearing_deg=-3.7 direction=stationary speed_kmh=0.038 has_crop=True has_processed=False

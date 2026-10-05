@@ -1,7 +1,3 @@
-
-
-# CameraManager.py 
-
 import cv2
 import os
 import time
@@ -18,7 +14,6 @@ class CameraManager:
         self.camera_location = camera_location
         self.save_dir = save_dir
         self.frame_interval = frame_interval
-        self.last_capture_time_s = None
         os.makedirs(self.save_dir, exist_ok=True)
 
         self.cap = cv2.VideoCapture(self.camera_index)
@@ -31,11 +26,7 @@ class CameraManager:
         ret, frame = self.cap.read()
         if not ret:
             raise RuntimeError("Error: failed to read frame.")
-        self.last_capture_time_s = time.monotonic()
         return frame
-
-    def get_capture_time_s(self):
-        return self.last_capture_time_s
 
     def get_frame_size(self):
         width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))

@@ -1,8 +1,4 @@
 
-
-# main.py
-
-
 import os
 import cv2
 import time
@@ -76,46 +72,35 @@ from videoManager import VideoManager
 #     main()
 
 
-def draw_boxes(frame, payload):
+def draw_boxes(frame, results):
     annotated = frame.copy()
 
-    for obj in payload.get("objects", []):
-        x1, y1, x2, y2 = obj["bbox"]
-        class_name = obj["class_name"]
-        confidence = obj["confidence"]
-        track_id = obj.get("track_id")
-        distance_m = obj.get("distance_m")
-        speed_kmh = obj.get("speed_kmh")
-        direction = obj.get("motion_direction", "unknown")
+    for r in results:
+        if r.boxes is None:
+            continue
 
-        line_1 = f"{class_name} {confidence:.2f} ID={track_id}"
-        distance_text = (
-            f"{distance_m:.1f}m" if distance_m is not None else "distance=N/A"
-        )
-        speed_text = (
-            f"{speed_kmh:.1f}km/h" if speed_kmh is not None else "speed=N/A"
-        )
-        line_2 = f"{distance_text} {speed_text} {direction}"
+        for box in r.boxes:
+            cls_id = int(box.cls[0].item())
+            conf = float(box.conf[0].item())
 
-        cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        cv2.putText(
-            annotated,
-            line_1,
-            (x1, max(20, y1 - 28)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (0, 255, 0),
-            2,
-        )
-        cv2.putText(
-            annotated,
-            line_2,
-            (x1, max(20, y1 - 8)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.50,
-            (0, 255, 255),
-            2,
-        )
+            if cls_id == 0:
+                label = "person"
+            elif cls_id in [2, 3, 5, 7]:
+                label = "vehicle"
+            else:
+                continue
+
+            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(
+                annotated,
+                f"{label} {conf:.2f}",
+                (x1, max(20, y1 - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 0),
+                2,
+            )
 
     return annotated
 
@@ -128,15 +113,7 @@ def parse_args():
     parser.add_argument("--camera_id", type=str, default="cam_1", help="Camera ID in metadata")
     parser.add_argument("--camera_location", type=str, default="desk-1", help="Camera location in metadata")
 
-    parser.add_argument(
-        "--frame_interval",
-        type=float,
-        default=0.0,
-        help=(
-            "Optional delay after each processed frame. Use 0 for reliable "
-            "tracking and speed estimation."
-        ),
-    )
+    parser.add_argument("--frame_interval", type=int, default=2, help="frame interval in seconds")
 
     # parser.add_argument("--edge_node_id", type=str, default="edge_1")
     # parser.add_argument("--edge_node_ip", type=str, default="192.168.10.10")
@@ -154,23 +131,11 @@ def parse_args():
     parser.add_argument("--save_images", action="store_true", default=False, help="Save processed objects under /tmp/processed_objects")
     parser.add_argument("--save_annotated_every", type=int, default=30, help="Save annotated frame every N frames; 0 disables")
     parser.add_argument("--send_empty", action="store_true", default=True, help="Send metadata even when no object is detected")
-    parser.add_argument(
-        "--calibration_file",
-        type=str,
-        default="camera_calibration.json",
-        help="Camera calibration JSON containing image-to-road point pairs",
-    )
-    parser.add_argument(
-        "--tracker",
-        type=str,
-        default="bytetrack.yaml",
-        help="Ultralytics tracker configuration",
-    )
     
     
     # route for raw captured frames
     parser.add_argument("--frame_vlan_interface", type=str, default="enp1s0.10")
-    parser.add_argument("--frame_dest_ip", type=str, default="192.168.20.11")
+    parser.add_argument("--frame_dest_ip", type=str, default="192.168.10.11")
     parser.add_argument("--frame_vlan_id", type=int, default=10)
     parser.add_argument("--frame_priority", type=int, default=7)
 
@@ -218,8 +183,6 @@ def get_input_metadata(args, input_source):
 def main():
     args = parse_args()
 
-    os.makedirs(args.save_dir, exist_ok=True)
-
     print("===== ARGUMENTS =====")
     for k, v in vars(args).items():
         print(f"{k}: {v}")
@@ -231,7 +194,6 @@ def main():
     if args.input_type == "camera":
         input_source = CameraManager(
             camera_index=args.camera_index,
-            camera_location=args.camera_location,
             frame_interval=args.frame_interval,
             save_dir=args.save_dir,
         )
@@ -253,23 +215,10 @@ def main():
     frame_id = 0
     video_writer = None
 
-    calibration = None
-    if args.calibration_file is not None:
-        with open(args.calibration_file, "r", encoding="utf-8") as file:
-            calibration = json.load(file)
-        print(f"Loaded camera calibration: {args.calibration_file}")
-    else:
-        print(
-            "[CALIBRATION WARNING] No calibration file was provided. "
-            "Tracking will work, but metric distance and speed will be N/A."
-        )
-
     processor = FrameProcessor(
         model_path=args.model_path,
         conf_threshold=args.conf_threshold,
         jpeg_quality=args.jpeg_quality,
-        calibration=calibration,
-        tracker=args.tracker,
     )
 
     try:
@@ -309,6 +258,9 @@ def main():
         )
 
         width, height, fps = input_source.get_frame_size() # select input source either camera/video depending on input 
+
+        print(f"[INPUT] Frame size: {width} x {height} pixels | FPS: {fps}") # Frame size: 640 x 480 pixels | FPS: 30.0
+
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         video_path = os.path.join(args.save_dir, f"session_{timestamp}.avi")
@@ -362,7 +314,9 @@ def main():
                 print("No valid frame received. Video may be finished or unsupported codec.")
                 break
 
-            capture_time_s = input_source.get_capture_time_s()
+            if frame_id ==0:
+                frame_height, frame_width = frame.shape[:2]
+                print(f"[ACTUAL FRAME] Size: {frame_width} x {frame_height} pixels")
 
             video_writer.write(frame)
 
@@ -372,32 +326,58 @@ def main():
                 camera_id=args.camera_id,
                 camera_location=args.camera_location,
                 save_images=args.save_images,
-                capture_time_s=capture_time_s,
             )
             
             print(
-                f"[CAM2 DETECTION DEBUG] frame_id={frame_id} "
+                f"[Camera {args.camera_index} DETECTION DEBUG] frame_id={frame_id} "
                 f"payload_objects={len(payload.get('objects', []))}"
             )
 
             for i, obj in enumerate(payload.get("objects", [])):
+                # print(
+                #     f"  object {i}: "
+                #     f"class={obj.get('class_name')} "
+                #     f"conf={obj.get('confidence')} "
+                #     f"bbox={obj.get('bbox')} "
+                #     f"has_crop={'crop_jpg_b64' in obj} "
+                #     f"has_processed={'processed_image' in obj}"
+                # )
+            
+                bbox = obj.get("bbox")
+                object_width = "unknown"
+                object_height = "unknown"
+
+                # Expected bbox format: [x1, y1, x2, y2]
+                if bbox is not None and len(bbox) == 4:
+                    x1, y1, x2, y2 = bbox
+                    object_width = int(x2 - x1)
+                    object_height = int(y2 - y1)
+
+                # JPEG crop size before Base64 encoding
+                crop_size_bytes = 0
+                if "crop_jpg_b64" in obj:
+                    crop_jpeg_bytes = base64.b64decode(obj["crop_jpg_b64"])
+                    crop_size_bytes = len(crop_jpeg_bytes)
+
+                # Size of this object record in the transmitted JSON data
+                object_json_size_bytes = len(json.dumps(obj).encode("utf-8"))
+
                 print(
-                    f"  object {i}: "
+                    f"[OBJECT SIZE] frame_id={frame_id} "
+                    f"object={i} "
                     f"class={obj.get('class_name')} "
-                    f"conf={obj.get('confidence')} "
-                    f"bbox={obj.get('bbox')} "
-                    f"track_id={obj.get('track_id')} "
-                    f"distance_m={obj.get('distance_m')} "
-                    f"bearing_deg={obj.get('bearing_angle_deg')} "
-                    f"direction={obj.get('motion_direction')} "
-                    f"speed_kmh={obj.get('speed_kmh')} "
-                    f"has_crop={'crop_jpg_b64' in obj} "
-                    f"has_processed={'processed_image' in obj}"
+                    f"confidence={obj.get('confidence')} "
+                    f"bbox={bbox} "
+                    f"bbox_size={object_width}x{object_height} pixels "
+                    f"crop_jpeg_size={crop_size_bytes} bytes "
+                    f"object_json_size={object_json_size_bytes} bytes"
                 )
+
+
     
     
 
-            annotated = draw_boxes(frame, payload)
+            annotated = draw_boxes(frame, results)
 
             if args.save_annotated_every > 0 and frame_id % args.save_annotated_every == 0:
                 jpg_name = os.path.join(args.save_dir, f"frame_{frame_id}.jpg")
@@ -422,7 +402,6 @@ def main():
                         "camera_id": args.camera_id,
                         "camera_location": args.camera_location,
                         "timestamp": datetime.now().isoformat(),
-                        "capture_time_s": capture_time_s,
                         "vlan_id": args.frame_vlan_id,
                         "vlan_interface": args.frame_vlan_interface,
                         "priority": args.frame_priority,
@@ -495,6 +474,16 @@ def main():
                     "objects": payload["objects"],   # send all objects together
                 }
 
+                object_payload_bytes = len(
+                    json.dumps(object_payload).encode("utf-8")
+                )
+
+                print(
+                    f"[OBJECT TRAFFIC] frame_id={frame_id} "
+                    f"objects={len(object_payload['objects'])} "
+                    f"total_object_packet={object_payload_bytes}B"
+                )
+
                 print(
                     f"[OBJECT PACKET SEND] frame_id={frame_id}, "
                     f"objects_in_packet={len(object_payload['objects'])}"
@@ -513,8 +502,7 @@ def main():
 
             frame_id += 1
             print(f"\n========== FRAME {frame_id} ==========")
-            if input_source.frame_interval > 0:
-                time.sleep(input_source.frame_interval)
+            time.sleep(input_source.frame_interval)
 
 
 

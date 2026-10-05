@@ -21,7 +21,7 @@ class ReIDVectorStore:
     ):
         """
         Initialize Weaviate Client for ReID embeddings storage
-        """
+        """   
         # Try to get from environment variables first
         env_weaviate_url = os.environ.get("WEAVIATE_URL")
         weaviate_api_key = os.environ.get("WEAVIATE_API_KEY")
@@ -56,6 +56,8 @@ class ReIDVectorStore:
         print(f"✅ Weaviate ready: {self.client.is_ready()}")
         self.collection_name = collection_name
         self.setup_schema()
+        self.ensure_extra_properties()
+        
         print("📋 Schema setup complete")
 
     def close(self):
@@ -125,11 +127,11 @@ class ReIDVectorStore:
                     #     data_type=DataType.TEXT,
                     #     description="Feature extraction model used (e.g. TransReID, OSNet, etc.).",
                     # ),
-                    # Property(
-                    #     name="person_id",
-                    #     data_type=DataType.TEXT,
-                    #     description="Assigned person ID for ReID tracking.",
-                    # ),
+                    Property(
+                        name="person_id",
+                        data_type=DataType.TEXT,
+                        description="Assigned person ID for ReID tracking.",
+                    ),
                     Property(
                         name="reid_confidence",
                         data_type=DataType.NUMBER,
@@ -140,6 +142,13 @@ class ReIDVectorStore:
                         data_type=DataType.BOOL,
                         description="Whether this is a newly identified person.",
                     ),
+                    Property(name="camera_id", data_type=DataType.TEXT),
+                    
+                    Property(name="camera_location", data_type=DataType.TEXT),
+                    
+                    Property(name="frame_id", data_type=DataType.INT),
+
+
                     # Property(
                     #     name="image_crop_base64",
                     #     data_type=DataType.TEXT,
@@ -238,6 +247,47 @@ class ReIDVectorStore:
     #         print(f"❌ Error storing embeddings: {e}")
     #         return None
 
+
+    def ensure_extra_properties(self):
+        collection = self.client.collections.get(self.collection_name)
+        config = collection.config.get()
+        existing_props = {prop.name for prop in config.properties}
+
+        new_properties = []
+
+        if "person_id" not in existing_props:
+            new_properties.append(
+                Property(
+                    name="person_id",
+                    data_type=DataType.TEXT,
+                    description="Assigned ReID person identity.",
+                )
+            )
+
+        if "reid_confidence" not in existing_props:
+            new_properties.append(
+                Property(
+                    name="reid_confidence",
+                    data_type=DataType.NUMBER,
+                    description="Confidence score for ReID identity assignment.",
+                )
+            )
+
+        if "is_new_person" not in existing_props:
+            new_properties.append(
+                Property(
+                    name="is_new_person",
+                    data_type=DataType.BOOL,
+                    description="Whether this detection is a new person.",
+                )
+            )
+
+        for prop in new_properties:
+            collection.config.add_property(prop)
+            print(f"Added missing Weaviate property: {prop.name}")
+
+
+            
     def store_embeddings(self, objects_data: Dict, embeddings: torch.Tensor):
         """
         Store ReID embeddings with metadata in Weaviate
@@ -269,6 +319,8 @@ class ReIDVectorStore:
             for i, obj in enumerate(objects_data["objects"]):
                 # ✅ critical fix: flatten to 1D float list
                 embedding_vector = embeddings[i].astype(np.float32).flatten().tolist()
+                
+                metadata = objects_data.get("metadata", {})
 
                 timestamp_raw = objects_data["metadata"].get(
                     "timestamp", datetime.now().timestamp()
@@ -290,12 +342,38 @@ class ReIDVectorStore:
                         datetime.fromtimestamp(float(timestamp_raw)).isoformat() + "Z"
                     )
 
+                # data_object = {
+                #     "class_name": obj.get("class_name", "unknown"),
+                #     "timestamp": timestamp_iso,
+                #     "reid_confidence": float(obj.get("reid_confidence", 0.0)),
+                #     "is_new_person": bool(obj.get("is_new_person", True)),
+                # }
+                
                 data_object = {
-                    "class_name": obj.get("class_name", "unknown"),
+                    "class_name": obj.get("class_name", "person"),
+                    "person_id": obj.get("person_id", "unknown"),   # ADD THIS
                     "timestamp": timestamp_iso,
                     "reid_confidence": float(obj.get("reid_confidence", 0.0)),
                     "is_new_person": bool(obj.get("is_new_person", True)),
+                    
+                     # camera metadata
+                    "camera_id": str(metadata.get("camera_id", "unknown")),
+                    "camera_location": str(metadata.get("camera_location", "unknown")),
+                    "frame_id": int(metadata.get("frame_id", 0)),
+                    "timestamp": timestamp_iso,
+    
+    
                 }
+                
+                print(
+                    f"[STORE] person_id={data_object['person_id']} "
+                    f"camera={data_object['camera_id']} "
+                    f"location={data_object['camera_location']} "
+                    f"frame={data_object['frame_id']} "
+                    f"is_new={data_object['is_new_person']}"
+                    )
+                    
+                    
 
                 print(
                     f"DEBUG vector type={type(embedding_vector)}, "

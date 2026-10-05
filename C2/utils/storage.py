@@ -13,6 +13,7 @@ import pickle
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 from typing import List
+from unittest import result
 
 import numpy as np
 from cryptography.hazmat.primitives import hashes, hmac
@@ -33,10 +34,11 @@ class SecureReIDStorage:
         mongo_db_url = f"mongodb://{mongo_user}:{mongo_pass}@{mongo_host_url}"
         # mongo_db_url = os.getenv("MONGO_HOST_URL", "mongodb://localhost:27017")
         print(f"Connecting to MongoDB at {mongo_db_url}...")
-        client = MongoClient(mongo_db_url)
-        db = client[os.environ["MONGO_DB_NAME"]]
+        self.client = MongoClient(mongo_db_url)
+        self.db = self.client[os.environ["MONGO_DB_NAME"]]
         self.aesgcm = AESGCM(MASTER_ENC_KEY)
-        self.collection = db[os.environ["MONGO_COLLECTION_NAME"]]
+        self.collection = self.db[os.environ["MONGO_COLLECTION_NAME"]]
+        self.raw_frames_collection = self.db["raw_frames"]
 
     def _hash_embedding(self, embedding_vector: np.ndarray) -> str:
         # creating hash of embedding for MongoDB key
@@ -151,6 +153,26 @@ class SecureReIDStorage:
 
         print(f"Retrieved {len(results)} results for embedding {embedding_hash[:8]}...")
         return results
+    
+    
+    def store_raw_frame_doc(self, doc: dict):
+        
+        """ 
+        Store a raw frame document in the "raw_frames" collection. The document should contain:
+        {
+            "camera_id": str,
+            "camera_location": str,
+            "frame_id": str,
+            "timestamp": str,
+            "frame_data": bytes (encrypted image data)
+        }
+        """
+
+        print(f"Storing raw frame document for camera {doc.get('camera_id', 'unknown')} at location {doc.get('camera_location', 'unknown')} with frame ID {doc.get('frame_id', 'unknown')}...")
+        
+        result = self.db["raw_frames"].insert_one(doc)
+        
+        return result.inserted_id
 
     def close(self):
         self.client.close()

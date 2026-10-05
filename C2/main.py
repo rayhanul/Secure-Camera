@@ -22,42 +22,118 @@ from utils.storage import SecureReIDStorage
 from utils.util import objects_to_tensor
 from utils.weaviate import ReIDVectorStore
 
+import struct
 
+MAX_DGRAM = 60000
 
+SINGLE_PACKET_TYPE = 0
+CHUNK_PACKET_TYPE = 1
 
-# from torchvision import transforms as T
-# from utils.reid_result import ReIDResult  # Just a data class
-# from utils.results_saver import ReIDResultsSaver
-# from utils.storage import SecureReIDStorage
+HEADER_FORMAT = "!HIHH"
+HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 
-# # TransReID imports will be handled within the TransReIDProcessor class
-# from utils.util import objects_to_tensor
-# from utils.weaviate import ReIDVectorStore
 
 
 import sys
 sys.path.insert(0, '/home/jdg24001/Documents/github/Secure-Camera/C2')
 
 
+# class TSNReceiver:
+#     def __init__(self, listen_ip="0.0.0.0", port=12345, buffer_size=65535):
+#         self.listen_ip = listen_ip
+#         self.port = port
+#         self.buffer_size = buffer_size
+
+#         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+#         self.sock.bind((self.listen_ip, self.port))
+
+#         print(f"Listening on {self.listen_ip}:{self.port}")
+
+#     def get_data(self) -> Dict:
+#         packet, addr = self.sock.recvfrom(self.buffer_size)
+#         raw = zlib.decompress(packet)
+#         data = json.loads(raw.decode("utf-8"))
+#         return data
+
+#     def close(self):
+#         self.sock.close()
+
 class TSNReceiver:
     def __init__(self, listen_ip="0.0.0.0", port=12345, buffer_size=65535):
         self.listen_ip = listen_ip
         self.port = port
         self.buffer_size = buffer_size
+        self.chunk_buffers = {}
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind((self.listen_ip, self.port))
 
         print(f"Listening on {self.listen_ip}:{self.port}")
 
-    def get_data(self) -> Dict:
+    def get_data(self) -> Optional[Dict]:
         packet, addr = self.sock.recvfrom(self.buffer_size)
-        raw = zlib.decompress(packet)
+
+        if len(packet) < HEADER_SIZE:
+            print("Packet too small, ignoring")
+            return None
+
+        packet_type, message_id, total_chunks, chunk_index = struct.unpack(
+            HEADER_FORMAT,
+            packet[:HEADER_SIZE],
+        )
+
+        payload_bytes = packet[HEADER_SIZE:]
+
+        if packet_type == SINGLE_PACKET_TYPE:
+            raw = zlib.decompress(payload_bytes)
+            data = json.loads(raw.decode("utf-8"))
+            data["_source_addr"] = addr[0]
+            return data
+
+        if packet_type == CHUNK_PACKET_TYPE:
+            return self._handle_chunk(
+                message_id=message_id,
+                total_chunks=total_chunks,
+                chunk_index=chunk_index,
+                payload_bytes=payload_bytes,
+                addr=addr,
+            )
+
+        print(f"Unknown packet type: {packet_type}")
+        return None
+
+    def _handle_chunk(self, message_id, total_chunks, chunk_index, payload_bytes, addr):
+        if message_id not in self.chunk_buffers:
+            self.chunk_buffers[message_id] = {
+                "total_chunks": total_chunks,
+                "chunks": {},
+                "source_addr": addr[0],
+                "start_time": time.time(),
+            }
+
+        self.chunk_buffers[message_id]["chunks"][chunk_index] = payload_bytes
+
+        received = len(self.chunk_buffers[message_id]["chunks"])
+        print(f"[CHUNK RX] message_id={message_id}, chunk={chunk_index + 1}/{total_chunks}")
+
+        if received < total_chunks:
+            return None
+
+        chunks = self.chunk_buffers[message_id]["chunks"]
+        compressed = b"".join(chunks[i] for i in range(total_chunks))
+
+        del self.chunk_buffers[message_id]
+
+        raw = zlib.decompress(compressed)
         data = json.loads(raw.decode("utf-8"))
+        data["_source_addr"] = addr[0]
+
+        print(f"[CHUNK COMPLETE] message_id={message_id}, type={data.get('type')}")
         return data
 
     def close(self):
         self.sock.close()
+
 
 
 class TransReIDProcessor:
@@ -67,7 +143,7 @@ class TransReIDProcessor:
         config_path="/home/jdg24001/Documents/github/Secure-Camera/weights-models/vit_transreid_stride.yml",
     ):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"🎯 Device selected: {self.device}")
+        print(f"Device selected: {self.device}")
         if torch.cuda.is_available():
             print(f"GPU: {torch.cuda.get_device_name(0)}")
         self.load_model(model_path, config_path)
@@ -99,20 +175,20 @@ class TransReIDProcessor:
             if os.path.exists(model_path):
                 try:
                     self.model.load_param(model_path)
-                    print(f"✅ Successfully loaded weights from {model_path}")
+                    print(f"Successfully loaded weights from {model_path}")
                 except Exception:
-                    print("⚠️ Standard loading failed, trying partial loading...")
+                    print("Standard loading failed, trying partial loading...")
                     self._load_weights_partially(model_path)
-                    print("✅ Partially loaded weights")
+                    print("Partially loaded weights")
             else:
-                print(f"❌ Warning: Weights not found at {model_path}")
+                print(f"Warning: Weights not found at {model_path}")
 
             self.model.to(self.device)
             self.model.eval()
-            print(f"✅ TransReID model loaded successfully on {self.device}")
+            print(f"TransReID model loaded successfully on {self.device}")
 
         except Exception as e:
-            print(f"❌ Error loading TransReID model: {e}")
+            print(f"Error loading TransReID model: {e}")
             self.model = None
 
     def _load_weights_partially(self, model_path):
@@ -130,7 +206,7 @@ class TransReIDProcessor:
 
     def extract_features(self, person_images):
         if self.model is None:
-            print("⚠️ TransReID model not loaded, using fallback normalization")
+            print("TransReID model not loaded, using fallback normalization")
             # return torch.nn.functional.normalize(person_images, dim=1, p=2)
 
             pooled = person_images.mean(dim=(2, 3))
@@ -156,7 +232,7 @@ class TransReIDProcessor:
                 features = self.model(person_images)
                 return features.cpu()
         except Exception as e:
-            print(f"⚠️ Feature extraction fallback due to error: {e}")
+            print(f"Feature extraction fallback due to error: {e}")
             # return torch.nn.functional.normalize(person_images, dim=1, p=2)
 
             pooled = torch.nn.functional.adaptive_avg_pool2d(person_images, (16, 16))
@@ -193,7 +269,7 @@ class WeaviateReIDManager:
             similar_persons = self.find_similar_persons(
                 person_feature,
                 obj.get("class_name", "person"),
-                objects_data["metadata"]["camera_id"],
+                objects_data["metadata"]["camera_id"]
             )
 
             person_identity = self.determine_identity(
@@ -212,6 +288,7 @@ class WeaviateReIDManager:
                 "similar_detections": len(similar_persons),
                 "bbox": obj.get("bbox", [0, 0, 0, 0]),
                 "camera_id": objects_data["metadata"]["camera_id"],
+                "camera_location": objects_data["metadata"]["camera_location"],
                 "frame_id": objects_data["metadata"]["frame_id"],
                 "timestamp": objects_data["metadata"]["timestamp"],
                 "cross_camera_matches": person_identity.get("cross_camera_matches", []),
@@ -245,7 +322,7 @@ class WeaviateReIDManager:
             return filtered_results
 
         except Exception as e:
-            print(f"❌ Error in similarity search: {e}")
+            print(f"Error in similarity search: {e}")
             return []
 
     def determine_identity(
@@ -323,6 +400,7 @@ class WeaviateReIDManager:
                 confidence=float(obj.get("confidence", 0.0)),
                 bbox=obj.get("bbox", [0, 0, 0, 0]),
                 camera_id=str(objects_data["metadata"].get("camera_id", "unknown")),
+                camera_location=str(objects_data["metadata"].get("camera_location", "unknown")),
                 frame_id=int(objects_data["metadata"].get("frame_id", 0)),
                 timestamp=str(objects_data["metadata"].get("timestamp", 0)),
                 embedding_method="TransReID",
@@ -352,7 +430,7 @@ class WeaviateReIDManager:
             return result if result else None
 
         except Exception as e:
-            print(f"❌ Error storing person data: {e}")
+            print(f"Error storing person data: {e}")
             return None
 
     def calculate_similarity(self, query_feature: torch.Tensor, result: Dict) -> float:
@@ -379,7 +457,7 @@ class C2Processor:
         self.results_saver = None
         if args.save_results:
             self.results_saver = ReIDResultsSaver(self.weaviate_manager.mongo_storage)
-            print("📁 Results saver enabled - will save to 'results' folder")
+            print("Results saver enabled - will save to 'results' folder")
 
         self.person_transform = T.Compose(
             [
@@ -390,7 +468,57 @@ class C2Processor:
             ]
         )
 
-        print("🚀 TSN receiver with Weaviate ReID initialized")
+        print("TSN receiver with Weaviate ReID initialized")
+
+        # Runtime statistics... ... ... 
+
+        self.start_time = time.time()
+        self.frames_processed = 0
+        self.persons_detected = 0
+        self.new_persons = 0
+        self.existing_persons = 0
+        self.stats_interval = 15
+
+
+    def update_statistics(self, reid_results: List[Dict]):
+        """
+        Update runtime statistics after processing one detected_objects packet.
+        """
+
+        self.frames_processed += 1
+
+        persons_in_frame = len(reid_results)
+        self.persons_detected += persons_in_frame
+
+        new_in_frame = sum(1 for r in reid_results if r.get("is_new_person", False))
+        existing_in_frame = persons_in_frame - new_in_frame
+
+        self.new_persons += new_in_frame
+        self.existing_persons += existing_in_frame
+
+        if self.frames_processed % self.stats_interval == 0:
+            self.print_statistics()
+
+
+    def print_statistics(self):
+        runtime = time.time() - self.start_time
+
+        if runtime > 0:
+            fps = self.frames_processed / runtime
+        else:
+            fps = 0.0
+
+        print("\n" + "-" * 80)
+        print(f"STATISTICS (Runtime: {runtime:.1f}s):")
+        print(f"  Frames processed: {self.frames_processed} ({fps:.2f} FPS)")
+        print(f"  Persons detected: {self.persons_detected}")
+        print(f"  New persons: {self.new_persons}")
+        print(f"  Existing persons: {self.existing_persons}")
+        print("-" * 80)
+
+
+
+
 
     def crop_b64_to_processed_image(self, crop_b64: str) -> Optional[List]:
         try:
@@ -405,7 +533,7 @@ class C2Processor:
             return tensor.tolist()
 
         except Exception as e:
-            print(f"⚠️ Failed to decode crop_jpg_b64: {e}")
+            print(f"Failed to decode crop_jpg_b64: {e}")
             return None
 
     def normalize_incoming_data(self, data: Dict) -> Dict:
@@ -433,7 +561,8 @@ class C2Processor:
 
             frame_id = data["metadata"].get("frame_id", "unknown")
             camera_id = data["metadata"].get("camera_id", "unknown")
-            print(f"🎬 Processing frame {frame_id} from camera {camera_id}")
+            camera_location = data["metadata"].get("camera_location", "unknown")
+            print(f"Processing frame {frame_id} from camera {camera_id} at location {camera_location}")
 
             valid_objects = [
                 obj for obj in data.get("objects", [])
@@ -441,20 +570,22 @@ class C2Processor:
             ]
 
             if not valid_objects:
-                print("⚠️ No valid person objects with processed_image found")
+                print("No valid person objects with processed_image found")
                 return []
 
             data["objects"] = valid_objects
 
             raw_features = objects_to_tensor(data["objects"])
             reid_features = self.transreid_processor.extract_features(raw_features)
-            print(f"🔍 Extracted features for {len(data.get('objects', []))} objects")
+            print(f"Extracted features for {len(data.get('objects', []))} objects")
 
             reid_features = torch.nn.functional.normalize(reid_features, dim=1, p=2)
 
             reid_results = self.weaviate_manager.process_and_identify(
                 data, reid_features
             )
+            
+            self.display_results(reid_results)
 
             if self.args.save_results:
                 self.save_simple_results(data, reid_results)
@@ -462,20 +593,152 @@ class C2Processor:
             return reid_results
 
         except Exception as e:
-            print(f"❌ Error processing detection: {e}")
+            print(f"Error processing detection: {e}")
             return []
 
+    def log_rx(self, data: Dict, status: str = "received"):
+        metadata = data.get("metadata", {})
+
+        payload_type = data.get("type") or metadata.get("payload_type", "unknown")
+        frame_id = metadata.get("frame_id", "NA")
+        camera_id = metadata.get("camera_id", "NA")
+        camera_location = metadata.get("camera_location", "unknown")
+        vlan_id = metadata.get("vlan_id", "NA")
+        vlan_interface = metadata.get("vlan_interface", "NA")
+        source_addr = data.get("_source_addr", "NA")
+        num_objects = len(data.get("objects", [])) if "objects" in data else 0
+
+        print(
+            f"[RX] status={status} "
+            f"type={payload_type} "
+            f"frame_id={frame_id} "
+            f"camera={camera_id} "
+            f"location={camera_location} "
+            f"objects={num_objects} "
+            f"vlan={vlan_id} "
+            f"iface={vlan_interface} "
+            f"src={source_addr}"
+        )
+
+
+    def handle_raw_frame(self, data: Dict):
+        try:
+            metadata = data.get("metadata", {})
+            frame_id = metadata.get("frame_id", "unknown")
+            camera_id = metadata.get("camera_id", "unknown")
+            camera_location = metadata.get("camera_location", "unknown")
+            frame_b64 = data.get("frame_jpg_b64")
+            if not frame_b64:
+                print(f"Raw frame packet missing frame_jpg_b64, frame_id={frame_id}")
+                return
+
+            frame_bytes = base64.b64decode(frame_b64)
+            arr = np.frombuffer(frame_bytes, dtype=np.uint8)
+            frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+            if frame is None:
+                print(f"Could not decode raw frame, frame_id={frame_id}")
+                return
+
+            doc = {
+                "frame_id": frame_id,
+                "camera_id": camera_id,
+                "camera_location": camera_location,
+                "timestamp": metadata.get("timestamp"),
+                "image_format": "jpg",
+                "image_bytes": frame_bytes,
+            }
+            
+            try:
+                mongo_id = self.weaviate_manager.mongo_storage.store_raw_frame_doc(doc)
+            except Exception as e:
+                print(f"Error storing raw frame doc in MongoDB: {e}")
+                mongo_id = None
+    
+    
+            save_dir = "received_raw_frames"
+            os.makedirs(save_dir, exist_ok=True)
+
+            filename = os.path.join(
+                save_dir,
+                f"{camera_location}_{camera_id}_frame_{frame_id}.jpg",
+            )
+
+            cv2.imwrite(filename, frame)
+
+            # print(
+            #     f"[RAW FRAME RX] frame_id={frame_id}, "
+            #     f"camera={camera_id}, saved={filename}, "
+            #     f"source={data.get('_source_addr')}"
+            # )
+            self.log_rx(data, status=f"raw_frame_saved saved={filename}")
+
+        except Exception as e:
+            print(f"Error handling raw frame: {e}")
+
+
+
+    # def run(self):
+    #     print("Starting continuous TSN packet processing...")
+
+    #     while True:
+    #         try:
+    #             data = self.receiver.get_data()
+    #             if data:
+    #                 results = self.process_detection(data)
+
+    #                 if results and self.args.save_results and self.args.save_json:
+    #                     self.save_results_summary(results)
+
+    #         except KeyboardInterrupt:
+    #             print("\nStopping C2 processor...")
+    #             break
+    #         except Exception as e:
+    #             print(f"Unexpected error: {e}")
+    #             time.sleep(1)
+    #             continue
+
+
     def run(self):
-        print("🔄 Starting continuous TSN packet processing...")
+        print("Starting continuous TSN packet processing...")
 
         while True:
             try:
                 data = self.receiver.get_data()
-                if data:
+
+                if data is None:
+                    continue
+
+                payload_type = data.get("type") or data.get("metadata", {}).get("payload_type")
+
+                if payload_type == "raw_frame":
+                    # self.log_rx(data, status="raw_frame_received")
+                    self.handle_raw_frame(data)
+                    continue
+
+                if payload_type == "detected_objects":
+                    if not data.get("objects"):
+                        # frame_id = data.get("metadata", {}).get("frame_id", "unknown")
+                        # vlan_id = data.get("metadata", {}).get("vlan_id", "unknown")
+                        # print(f"[EMPTY OBJECT RX] frame_id={frame_id}, vlan={vlan_id}")
+
+                        self.log_rx(data, status="empty_object_packet")
+                        continue
+
+                    self.log_rx(data, status="object_packet_received")
+
                     results = self.process_detection(data)
+
+                    # Update runtime statistics
+                    self.update_statistics(results)
 
                     if results and self.args.save_results and self.args.save_json:
                         self.save_results_summary(results)
+
+                    continue
+
+                # print(f"Unknown payload type: {payload_type}")
+                self.log_rx(data, status="unknown_payload")
 
             except KeyboardInterrupt:
                 print("\nStopping C2 processor...")
@@ -485,6 +748,28 @@ class C2Processor:
                 time.sleep(1)
                 continue
 
+
+    def display_results(self, results: List[Dict]):
+        print(f"\nReID Results ({len(results)} persons detected):")
+        print("-" * 80)
+
+        for result in results:
+            status = "NEW" if result.get("is_new_person") else "EXISTING"
+            cross_cam = (
+                f", {len(result.get('cross_camera_matches', []))} cross-camera"
+                if result.get("cross_camera_matches")
+                else ""
+            )
+            print(
+                f"{status} | ID: {result.get('person_id')} | "
+                f"Conf: {float(result.get('confidence', 0.0)):.3f} | "
+                f"Camera: {result.get('camera_id')} | "
+                f"Similar: {result.get('similar_detections', 0)}{cross_cam}"
+            )
+
+        print("-" * 80)
+        
+        
     def save_results_summary(self, results: List[Dict]):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"reid_results_{timestamp}.json"
@@ -494,19 +779,20 @@ class C2Processor:
                 json.dump(results, f, indent=2, default=str)
             print(f"Results saved to {filename}")
         except Exception as e:
-            print(f"❌ Error saving results: {e}")
+            print(f"Error saving results: {e}")
 
     def save_simple_results(self, data: Dict, reid_results: List[Dict]):
         try:
             frame_id = str(data["metadata"].get("frame_id", "unknown"))
             camera_id = str(data["metadata"].get("camera_id", "unknown"))
+            camera_location = str(data["metadata"].get("camera_location", "unknown"))
 
             if not self.results_saver:
-                print("⚠️ Results saver not initialized.")
+                print("Results saver not initialized.")
                 return
 
             saver = self.results_saver
-            print(f"💾 Saving results for {len(reid_results)} detected persons...")
+            print(f"Saving results for {len(reid_results)} detected persons...")
 
             for result in reid_results:
                 person_id = result.get("person_id", "unknown")
@@ -547,7 +833,7 @@ class C2Processor:
                         query_image_data = img_buffer.getvalue()
 
                 except Exception as e:
-                    print(f"⚠️ Could not extract features for person {person_id}: {e}")
+                    print(f"Could not extract features for person {person_id}: {e}")
                     continue
 
                 similar_embeddings = []
@@ -574,9 +860,9 @@ class C2Processor:
                                     similar_embeddings.append(vector_array)
 
                     except Exception as e:
-                        print(f"⚠️ Error getting similar embeddings from Weaviate: {e}")
+                        print(f"Error getting similar embeddings from Weaviate: {e}")
 
-                query_name = f"person_{person_id}_frame_{frame_id}_cam_{camera_id}"
+                query_name = f"person_{person_id}_frame_{frame_id}_cam_{camera_id}_location_{camera_location}"
 
                 try:
                     saver.save_query_results_with_image(
@@ -584,14 +870,15 @@ class C2Processor:
                         similar_embeddings=similar_embeddings,
                         query_name=query_name,
                         camera_id=camera_id,
+                        camera_location=camera_location,
                         frame_id=frame_id,
                         query_image_data=query_image_data,
                     )
                 except Exception as e:
-                    print(f"❌ Error saving results for person {person_id}: {e}")
+                    print(f"Error saving results for person {person_id}: {e}")
 
         except Exception as e:
-            print(f"❌ Error in save_simple_results: {e}")
+            print(f"Error in save_simple_results: {e}")
 
     def close(self):
         self.receiver.close()
@@ -619,11 +906,28 @@ def parse_args():
         type=str,
         default="/home/jdg24001/Documents/github/Secure-Camera/weights-models/weights/transformer_best.pth",
     )
-    parser.add_argument("--similarity_threshold", type=float, default=0.7)
-    parser.add_argument("--save_results", action="store_true")
-    parser.add_argument("--save_json", action="store_true")
-    parser.add_argument("--store_crops", action="store_true")
-    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--similarity_threshold",
+        type=float,
+        default=0.7,
+        help="Similarity threshold for person matching",
+    )
+    
+    parser.add_argument(
+        "--save_results", action="store_true", help="Save processing results to file"
+    )
+    parser.add_argument(
+        "--save_json", action="store_true", help="Save reid_results JSON files"
+    )
+    parser.add_argument(
+        "--store_crops",
+        action="store_true",
+        help="Store image crops in Weaviate as base64",
+    )
+    parser.add_argument(
+        "--verbose", action="store_true", help="Enable verbose debug output"
+    )
+
     return parser.parse_args()
 
 
